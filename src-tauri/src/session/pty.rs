@@ -1,0 +1,579 @@
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, TryLockError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+
+use super::binary::ssh_not_found;
+use super::io::read_chunk;
+use super::SessionEvent;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Shutdown waits this long for the reaper after the PTY ends are released.
+/// On timeout the join is detached so close cannot block forever.
+const REAPER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long release waits if a write or resize still holds the end.
+const END_LOCK_WAIT: Duration = Duration::from_millis(250);
+
+/// After the child exits, wait at most this long for the reader to finish
+/// sending the bytes already in the pipe. Windows ConPTY does not EOF until
+/// the writer and master are released; that release shares this deadline so
+/// a stuck read cannot bring back the shutdown hang.
+const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+
+type PtyWriter = Box<dyn std::io::Write + Send>;
+type PtyMaster = Box<dyn MasterPty + Send>;
+
+/// One running ssh process and the threads that move its output.
+pub struct LiveSession {
+    pub id: String,
+    /// Set once the child has been waited on. Shutdown reports failure when
+    /// the reaper is detached before this happens.
+    pub reaped: Arc<AtomicBool>,
+    /// `None` once shutdown has released the write end.
+    pub writer: Arc<Mutex<Option<PtyWriter>>>,
+    /// `None` once shutdown has released the master.
+    ///
+    /// ConPTY does not EOF a blocked read until both ends are dropped.
+    pub master: Arc<Mutex<Option<PtyMaster>>>,
+    kill_tx: Option<mpsc::Sender<()>>,
+    reaper: Option<JoinHandle<()>>,
+}
+
+impl LiveSession {
+    /// Stop the child, release the PTY ends, and wait until it is reaped.
+    pub fn shutdown(mut self) -> Result<(), String> {
+        self.finish()?;
+        if self.reaped.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            Err(tr!("会话未回收", "The session was not cleaned up"))
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.signal_stop();
+        // Drop the ends before joining. On Windows the reader never sees EOF
+        // while the master or writer is still open, so joining first deadlocks.
+        self.release_ends();
+        self.join_reaper()
+    }
+
+    fn signal_stop(&mut self) {
+        if let Some(tx) = self.kill_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+
+    fn release_ends(&self) {
+        take_end(&self.writer);
+        take_end(&self.master);
+    }
+
+    fn join_reaper(&mut self) -> Result<(), String> {
+        if let Some(handle) = self.reaper.take() {
+            return join_with_timeout(handle);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for LiveSession {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// Open a PTY and spawn `program` with `args` directly.
+///
+/// `program` is the absolute path of the system ssh binary. Arguments are
+/// appended one by one; the shell is not involved. Callers outside this crate
+/// cannot pass a program: the only command that starts a session resolves ssh
+/// itself.
+pub(crate) fn start_pty(
+    program: &Path,
+    args: &[String],
+    on_event: impl Fn(SessionEvent) -> Result<(), ()> + Send + 'static,
+) -> Result<LiveSession, String> {
+    if !program.is_absolute() {
+        return Err(ssh_not_found());
+    }
+
+    let mut command = CommandBuilder::new(program);
+    command.args(args);
+    // A GUI launch has no TERM. ssh passes it to the remote side, which turns
+    // off `ls` colors and colored prompts without it. xterm.js draws 256
+    // colors and true color.
+    command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+
+    let system = native_pty_system();
+    let pair = system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|_| tr!("无法创建终端", "Could not create the terminal"))?;
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|_| tr!("启动 ssh 失败", "Failed to start ssh"))?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|_| tr!("无法读取终端输出", "Could not read terminal output"))?;
+    let writer =
+        Arc::new(Mutex::new(Some(pair.master.take_writer().map_err(
+            |_| tr!("无法写入终端", "Could not write to the terminal"),
+        )?)));
+    let master = Arc::new(Mutex::new(Some(pair.master)));
+    drop(pair.slave);
+    let reaped = Arc::new(AtomicBool::new(false));
+
+    let (event_tx, event_rx) = mpsc::channel();
+    let reader_tx = event_tx.clone();
+    let reader_handle =
+        match thread::Builder::new()
+            .name("pty-reader".to_string())
+            .spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match read_chunk(&mut reader, &mut buf) {
+                        Ok(Some(bytes)) => {
+                            if reader_tx.send(SessionEvent::Data { bytes }).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(_) => {
+                // `reader` moved into the closure, which is dropped on spawn failure.
+                drop(writer);
+                drop(master);
+                let _ = terminate(child);
+                return Err(tr!(
+                    "无法启动会话线程",
+                    "Could not start the session thread"
+                ));
+            }
+        };
+
+    let (kill_tx, kill_rx) = mpsc::channel::<()>();
+    type Boot = (
+        Box<dyn Child + Send + Sync>,
+        mpsc::Receiver<()>,
+        JoinHandle<()>,
+        mpsc::Sender<SessionEvent>,
+    );
+    let (boot_tx, boot_rx) = mpsc::channel::<Boot>();
+    let drain_writer = Arc::clone(&writer);
+    let drain_master = Arc::clone(&master);
+    let drain_reaped = Arc::clone(&reaped);
+    let reaper = match thread::Builder::new()
+        .name("pty-reaper".to_string())
+        .spawn(move || {
+            let Ok((child, kill_rx, reader_handle, event_tx)) = boot_rx.recv() else {
+                return;
+            };
+            let code = wait_or_kill(child, kill_rx);
+            drain_reaped.store(true, Ordering::SeqCst);
+            // Every Data send finishes inside the reader. Drain it before
+            // Exit so the channel cannot deliver the exit first. On Windows
+            // the drain releases the ConPTY ends; otherwise the read never
+            // sees EOF and the tail stays stuck behind this event.
+            drain_reader(reader_handle, &drain_writer, &drain_master);
+            let _ = event_tx.send(SessionEvent::Exit { code });
+        }) {
+        Ok(handle) => handle,
+        Err(_) => {
+            drop(writer);
+            drop(master);
+            let _ = join_with_timeout(reader_handle);
+            let _ = terminate(child);
+            return Err(tr!(
+                "无法启动会话线程",
+                "Could not start the session thread"
+            ));
+        }
+    };
+
+    if let Err(err) = boot_tx.send((child, kill_rx, reader_handle, event_tx)) {
+        let (child, _, reader_handle, _) = err.0;
+        drop(writer);
+        drop(master);
+        let _ = join_with_timeout(reader_handle);
+        let _ = join_with_timeout(reaper);
+        let _ = terminate(child);
+        return Err(tr!(
+            "无法启动会话线程",
+            "Could not start the session thread"
+        ));
+    }
+
+    // The forwarder only crosses into the UI. It is detached so shutting the
+    // session down never waits on the webview.
+    match thread::Builder::new()
+        .name("pty-forward".to_string())
+        .spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                if on_event(event).is_err() {
+                    break;
+                }
+            }
+        }) {
+        Ok(handle) => {
+            // Detach. Waiting for the UI here can deadlock window shutdown.
+            drop(handle);
+        }
+        Err(_) => {
+            drop(writer);
+            drop(master);
+            let _ = kill_tx.send(());
+            let _ = join_with_timeout(reaper);
+            return Err(tr!(
+                "无法启动会话线程",
+                "Could not start the session thread"
+            ));
+        }
+    }
+
+    let id = format!("session-{}", NEXT_ID.fetch_add(1, Ordering::Relaxed));
+    Ok(LiveSession {
+        id,
+        reaped,
+        writer,
+        master,
+        kill_tx: Some(kill_tx),
+        reaper: Some(reaper),
+    })
+}
+
+/// Take the PTY end out of the mutex and drop it.
+///
+/// A blocking lock here can stall behind `write_all`. Give up after a short
+/// wait so the timed reaper join still runs. The value is dropped outside
+/// the mutex: `ClosePseudoConsole` must not run while the lock is held.
+fn take_end<T>(slot: &Mutex<Option<T>>) {
+    drop(take_end_out_until(slot, Instant::now() + END_LOCK_WAIT));
+}
+
+fn take_end_out_until<T>(slot: &Mutex<Option<T>>, deadline: Instant) -> Option<T> {
+    loop {
+        match slot.try_lock() {
+            Ok(mut guard) => return guard.take(),
+            Err(TryLockError::Poisoned(poisoned)) => return poisoned.into_inner().take(),
+            Err(TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Publish every byte the reader already has, then return.
+///
+/// Unix reaches EOF or EIO once the slave closes, so the reader is joined
+/// directly. Windows ConPTY does not EOF until the writer and the master are
+/// released; those drops run beside the reader and share one short deadline.
+fn drain_reader(
+    reader: JoinHandle<()>,
+    writer: &Mutex<Option<PtyWriter>>,
+    master: &Mutex<Option<PtyMaster>>,
+) {
+    let deadline = Instant::now() + READER_DRAIN_TIMEOUT;
+    #[cfg(windows)]
+    let release = {
+        let writer = take_end_out_until(writer, deadline);
+        let master = take_end_out_until(master, deadline);
+        thread::Builder::new()
+            .name("pty-release".to_string())
+            .spawn(move || {
+                drop(writer);
+                drop(master);
+            })
+            .ok()
+    };
+    #[cfg(not(windows))]
+    {
+        // Dropping the Unix writer injects VEOF and can block on a full
+        // buffer. The slave close is what unblocks this read.
+        let _ = (writer, master);
+    }
+
+    let remain = deadline.saturating_duration_since(Instant::now());
+    let _ = join_for(reader, remain);
+
+    #[cfg(windows)]
+    if let Some(handle) = release {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        let _ = join_for(handle, remain);
+    }
+}
+
+/// Join `handle`, or detach it when it is still running after the timeout.
+fn join_with_timeout(handle: JoinHandle<()>) -> Result<(), String> {
+    join_for(handle, REAPER_JOIN_TIMEOUT)
+}
+
+fn join_for(handle: JoinHandle<()>, timeout: Duration) -> Result<(), String> {
+    if timeout.is_zero() {
+        drop(handle);
+        return Ok(());
+    }
+    let (tx, rx) = mpsc::channel();
+    let waiter = thread::Builder::new()
+        .name("pty-join".to_string())
+        .spawn(move || {
+            let _ = tx.send(handle.join());
+        });
+    let Ok(waiter) = waiter else {
+        // Spawn failed and dropped `handle`, which detaches that thread.
+        return Ok(());
+    };
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(())) => {
+            let _ = waiter.join();
+            Ok(())
+        }
+        Ok(Err(_)) => {
+            let _ = waiter.join();
+            Err(tr!(
+                "会话线程异常退出",
+                "The session thread exited unexpectedly"
+            ))
+        }
+        Err(_) => {
+            // Still running. Detach the waiter; do not block the caller.
+            drop(waiter);
+            Ok(())
+        }
+    }
+}
+
+fn wait_or_kill(
+    mut child: Box<dyn Child + Send + Sync>,
+    kill_rx: mpsc::Receiver<()>,
+) -> Option<i32> {
+    loop {
+        match kill_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return terminate(child),
+            Err(mpsc::RecvTimeoutError::Timeout) => match child.try_wait() {
+                Ok(Some(status)) => return Some(status.exit_code() as i32),
+                Ok(None) => continue,
+                Err(_) => return terminate(child),
+            },
+        }
+    }
+}
+
+/// Ask the child to exit, then wait until it has been reaped.
+///
+/// The first signal is the independent killer, which does not collect the
+/// status. `wait` / `try_wait` on this thread owns the exit code. If the
+/// process is still alive after a short grace period, the full stop is used.
+fn terminate(mut child: Box<dyn Child + Send + Sync>) -> Option<i32> {
+    let mut killer = child.clone_killer();
+    let _ = killer.kill();
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.exit_code() as i32),
+            Ok(None) if started.elapsed() < Duration::from_secs(2) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                return match child.try_wait() {
+                    Ok(Some(status)) => Some(status.exit_code() as i32),
+                    _ => match child.wait() {
+                        Ok(status) => Some(status.exit_code() as i32),
+                        Err(_) => Some(1),
+                    },
+                };
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Drives `start_pty` with a stand-in program. Not a frontend command.
+    #[test]
+    fn pty_session_emits_output_and_exit_code_then_shutdown() {
+        let (program, args) = short_lived_program();
+        let (tx, rx) = mpsc::channel();
+        let session = start_pty(&program, &args, move |event| tx.send(event).map_err(|_| ()))
+            .expect("start_pty");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut output = Vec::new();
+        let mut exit_code = None;
+        let mut answered_cursor = false;
+        while Instant::now() < deadline {
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remain) {
+                Ok(SessionEvent::Data { bytes }) => output.extend(bytes),
+                Ok(SessionEvent::Exit { code }) => exit_code = Some(code),
+                Err(_) => break,
+            }
+            // ConPTY asks for the cursor position and waits before the child
+            // prints or exits. xterm answers this in the app; the test must
+            // answer it on the PTY writer.
+            answer_cursor_query(&session, &output, &mut answered_cursor);
+            if bytes_contain_hi(&output) && exit_code == Some(Some(3)) {
+                break;
+            }
+        }
+
+        let started = Instant::now();
+        let shutdown_result = session.shutdown();
+        let elapsed = started.elapsed();
+
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            bytes_contain_hi(&output),
+            "expected output containing hi within 3s, got {text:?} exit={exit_code:?}"
+        );
+        assert_eq!(exit_code, Some(Some(3)), "output={text:?}");
+        shutdown_result.expect("shutdown");
+        // The join timeout is 3s and then detaches. A hang that only unblocks
+        // by detaching must fail this tighter bound.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown took {elapsed:?}"
+        );
+    }
+
+    /// Exit must not overtake the child's last bytes.
+    ///
+    /// The reader is still forwarding when `wait` returns. Counting only
+    /// bytes that arrived before `Exit`, then shutting down immediately,
+    /// fails if the exit event is published first.
+    #[test]
+    fn exit_is_emitted_only_after_tail_error() {
+        let (program, args) = trailing_output_program();
+        let (tx, rx) = mpsc::channel();
+        let session = start_pty(&program, &args, move |event| tx.send(event).map_err(|_| ()))
+            .expect("start_pty");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut exit_code = None;
+        let mut answered_cursor = false;
+        let mut session = Some(session);
+        while Instant::now() < deadline && exit_code.is_none() {
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remain) {
+                Ok(SessionEvent::Data { bytes }) => output.extend(bytes),
+                Ok(SessionEvent::Exit { code }) => {
+                    exit_code = Some(code);
+                    // Do not read any further Data. Shut down before the
+                    // assertion so a late tail cannot be counted.
+                    if let Some(session) = session.take() {
+                        let _ = session.shutdown();
+                    }
+                    break;
+                }
+                Err(_) => break,
+            }
+            if let Some(session) = session.as_ref() {
+                answer_cursor_query(session, &output, &mut answered_cursor);
+            }
+        }
+        if let Some(session) = session.take() {
+            let _ = session.shutdown();
+        }
+        while rx.try_recv().is_ok() {}
+
+        let text = String::from_utf8_lossy(&output);
+        assert_eq!(
+            exit_code,
+            Some(Some(255)),
+            "expected exit 255 within 10s, output={text:?}"
+        );
+        assert!(
+            text.contains("TAIL-ERROR"),
+            "TAIL-ERROR must arrive before Exit, got {text:?}"
+        );
+    }
+
+    fn bytes_contain_hi(output: &[u8]) -> bool {
+        String::from_utf8_lossy(output).contains("hi")
+    }
+
+    fn answer_cursor_query(session: &LiveSession, output: &[u8], answered: &mut bool) {
+        const QUERY: &[u8] = b"\x1b[6n";
+        if *answered || output.windows(QUERY.len()).all(|window| window != QUERY) {
+            return;
+        }
+        *answered = true;
+        let mut slot = session.writer.lock().unwrap_or_else(|err| err.into_inner());
+        let Some(writer) = slot.as_mut() else {
+            return;
+        };
+        use std::io::Write;
+        let _ = writer.write_all(b"\x1b[1;1R");
+        let _ = writer.flush();
+    }
+
+    fn short_lived_program() -> (PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            let program = PathBuf::from(root).join("System32").join("cmd.exe");
+            (
+                program,
+                vec!["/c".to_string(), "echo hi & exit 3".to_string()],
+            )
+        } else {
+            (
+                PathBuf::from("/bin/sh"),
+                vec!["-c".to_string(), "printf hi; exit 3".to_string()],
+            )
+        }
+    }
+
+    fn trailing_output_program() -> (PathBuf, Vec<String>) {
+        if cfg!(windows) {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+            let program = PathBuf::from(root).join("System32").join("cmd.exe");
+            (
+                program,
+                vec![
+                    "/c".to_string(),
+                    "(for /L %i in (1,1,4000) do @echo line%i) & echo TAIL-ERROR & exit 255"
+                        .to_string(),
+                ],
+            )
+        } else {
+            (
+                PathBuf::from("/bin/sh"),
+                vec![
+                    "-c".to_string(),
+                    "i=1; while [ $i -le 4000 ]; do echo line$i; i=$((i+1)); done; echo TAIL-ERROR; exit 255"
+                        .to_string(),
+                ],
+            )
+        }
+    }
+}

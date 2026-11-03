@@ -1,0 +1,169 @@
+// 终端里的复制、粘贴判定。不碰 DOM，剪贴板读写由调用方完成。
+
+import type { ConfirmText } from "./close-confirm.ts";
+import type { ShortcutKey } from "./tabs.ts";
+import { t } from "./locales/terminal.js";
+
+/** `copy-clear` copies, then drops the selection. */
+export type ClipboardAction = "copy" | "copy-clear" | "paste";
+
+/** Lines shown in the paste confirmation. */
+const PREVIEW_LINES = 5;
+/** Characters kept from each previewed line. */
+const PREVIEW_WIDTH = 80;
+
+/**
+ * The clipboard action for a key, or null to leave the key to the terminal.
+ *
+ * macOS: Cmd+C / Cmd+V. Ctrl+C always reaches the shell as ^C.
+ * Windows: Ctrl+Shift+C / Ctrl+Shift+V. Ctrl+C copies only when there is a
+ * selection; otherwise it is ^C.
+ */
+export function clipboardKey(
+  event: ShortcutKey,
+  platform: "mac" | "windows",
+  hasSelection: boolean,
+): ClipboardAction | null {
+  if (event.isComposing || event.altKey) {
+    return null;
+  }
+  const letter = latinLetter(event);
+  if (letter !== "c" && letter !== "v") {
+    return null;
+  }
+  if (platform === "mac") {
+    if (!event.metaKey || event.ctrlKey || event.shiftKey) {
+      return null;
+    }
+    return letter === "c" ? "copy" : "paste";
+  }
+  if (event.metaKey || !event.ctrlKey) {
+    return null;
+  }
+  if (event.shiftKey) {
+    return letter === "c" ? "copy" : "paste";
+  }
+  return letter === "c" && hasSelection ? "copy-clear" : null;
+}
+
+/** Windows right-click: copy a selection, otherwise paste. */
+export function rightClickAction(hasSelection: boolean): "copy-clear" | "paste" {
+  return hasSelection ? "copy-clear" : "paste";
+}
+
+/** Any line break asks first. A trailing one would run the command at once. */
+export function pasteNeedsConfirm(text: string): boolean {
+  return /[\r\n]/.test(text);
+}
+
+export function pasteLineCount(text: string): number {
+  return splitLines(text).length;
+}
+
+/** Wording for the in-app confirmation before a multi-line paste. */
+export function pasteConfirmText(text: string): ConfirmText {
+  const lines = splitLines(text);
+  const shown = lines
+    .slice(0, PREVIEW_LINES)
+    .map((line) => (line.length > PREVIEW_WIDTH ? `${line.slice(0, PREVIEW_WIDTH)}…` : line));
+  if (lines.length > PREVIEW_LINES) {
+    shown.push(t("pasteMore", { n: lines.length - PREVIEW_LINES }));
+  }
+  return {
+    message: t("pasteMessage", { n: lines.length }),
+    confirmLabel: t("paste"),
+    focusCancel: true,
+    detail: shown.join("\n"),
+  };
+}
+
+function splitLines(text: string): string[] {
+  const lines = text.split(/\r\n|\r|\n/);
+  if (lines.length > 1 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+  return lines;
+}
+
+/** The letter typed, or the physical key's letter on a non-Latin layout. */
+function latinLetter(event: ShortcutKey): string {
+  const key = event.key.toLowerCase();
+  if (/^[a-z]$/.test(key)) {
+    return key;
+  }
+  const match = /^Key([A-Z])$/.exec(event.code ?? "");
+  return match ? match[1].toLowerCase() : "";
+}
+
+/**
+ * Hands the terminal selection to the webview's own copy command.
+ *
+ * The command writes the clipboard synchronously, inside the key press, so no
+ * later write can replace it. Every copy event in a terminal tab, from the
+ * keyboard or the Edit menu, carries the selection as xterm builds it: wrapped
+ * rows joined, real line breaks kept.
+ */
+export class CopyRelay {
+  private pending: string | null = null;
+  private delivered = false;
+
+  /**
+   * Run `execCopy` with `text` waiting for the copy event. False when the
+   * command did not run or no copy event took the text; the caller then
+   * writes the clipboard another way.
+   */
+  copy(text: string, execCopy: () => boolean): boolean {
+    this.pending = text;
+    this.delivered = false;
+    let ran = false;
+    try {
+      ran = execCopy();
+    } catch {
+      ran = false;
+    } finally {
+      this.pending = null;
+    }
+    return ran && this.delivered;
+  }
+
+  /** Text for a copy event, or null to leave the event alone. */
+  take(selection: () => string): string | null {
+    const text = this.pending ?? selection();
+    if (text === "") {
+      return null;
+    }
+    if (this.pending !== null) {
+      this.delivered = true;
+    }
+    return text;
+  }
+}
+
+/**
+ * Text for an OSC 52 clipboard write (`Pc;Pd`), or null to ignore it.
+ *
+ * tmux, vim and Claude Code inside tmux copy this way: the program draws its
+ * own selection, so the terminal has none for Cmd+C. Programs may set the
+ * clipboard but never read it: a `?` request gets no answer. An empty or bad
+ * payload leaves the clipboard alone.
+ */
+export function osc52Text(data: string): string | null {
+  const split = data.indexOf(";");
+  if (split < 0) {
+    return null;
+  }
+  const target = data.slice(0, split);
+  const payload = data.slice(split + 1);
+  if (!/^[cpqs0-7]*$/.test(target) || payload === "" || payload.length % 4 !== 0) {
+    return null;
+  }
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(payload)) {
+    return null;
+  }
+  try {
+    const bytes = Uint8Array.from(atob(payload), (char) => char.charCodeAt(0));
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}

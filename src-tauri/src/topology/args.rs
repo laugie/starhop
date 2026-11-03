@@ -1,0 +1,490 @@
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::session::args::{build_ssh_args_with_options, SshOptions};
+
+use super::parse::{Device, Topology};
+use super::validate::{index, region_of};
+
+/// Arguments for one device, without a generated ssh config.
+///
+/// Shape: `-t -l <user> -p <port> [-i <path>] [-J <outer>,...] -- <host>`.
+pub fn ssh_args_for(topology: &Topology, device_name: &str) -> Result<Vec<String>, String> {
+    let device = find(topology, device_name).ok_or_else(|| {
+        tr!(
+            "没有名为「{device_name}」的设备",
+            "No device named \"{device_name}\""
+        )
+    })?;
+    let chain = jump_chain(topology, device)?;
+    let jump = jump_spec(&chain)?;
+    build_ssh_args_with_options(&SshOptions {
+        host: device.host.clone(),
+        user: Some(device.user.clone()),
+        port: Some(device.port),
+        identity_path: device.identity_file.clone(),
+        jump,
+    })
+    .map_err(|err| {
+        tr!(
+            "区域「{}」设备「{}」：{err}",
+            "Region \"{}\", device \"{}\": {err}",
+            region_of(topology, device_name),
+            device.name
+        )
+    })
+}
+
+pub(crate) fn check_device_tokens(device: &Device) -> Result<(), String> {
+    build_ssh_args_with_options(&SshOptions {
+        host: device.host.clone(),
+        user: Some(device.user.clone()),
+        port: Some(device.port),
+        identity_path: device.identity_file.clone(),
+        jump: None,
+    })
+    .map(|_| ())
+}
+
+/// ssh argv for a device, plus a temp config when a jump hop names a key path.
+pub struct SessionPlan {
+    pub args: Vec<String>,
+    pub temp_file: Option<TempSshConfig>,
+    /// Set only for a command relay. Direct and ProxyJump plans leave this empty.
+    pub(crate) relay: Option<super::relay::RelayEnds>,
+}
+
+/// One `0600` ssh config. Dropping an armed value deletes the file.
+pub struct TempSshConfig {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempSshConfig {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempSshConfig {
+    fn drop(&mut self) {
+        if self.armed && !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub fn plan_device_session(dir: &Path, device_name: &str) -> Result<SessionPlan, String> {
+    plan_device_session_with(dir, device_name, None)
+}
+
+/// `connection_name` selects a command relay. `None` keeps the direct / ProxyJump plan.
+pub fn plan_device_session_with(
+    dir: &Path,
+    device_name: &str,
+    connection_name: Option<&str>,
+) -> Result<SessionPlan, String> {
+    let path = dir.join("topology.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(tr!(
+                "未找到拓扑配置。请创建 {}，格式可参考仓库根目录的 topology.example.json。",
+                "Topology config not found. Create {}; see topology.example.json in the repository root for the format.",
+                path.display()
+            ));
+        }
+        Err(_) => {
+            return Err(tr!(
+                "无法读取拓扑配置",
+                "Could not read the topology config"
+            ))
+        }
+    };
+    if text.len() > 1_048_576 {
+        return Err(tr!("拓扑配置过大", "The topology config is too large"));
+    }
+    let topology = super::parse_topology(&text)?;
+    if let Some(name) = connection_name.filter(|name| !name.is_empty()) {
+        let (args, relay) = super::relay::prepare_relay(&topology, device_name, name)?;
+        return Ok(SessionPlan {
+            args,
+            temp_file: None,
+            relay: Some(relay),
+        });
+    }
+    let args = ssh_args_for(&topology, device_name)?;
+    let device = find(&topology, device_name).ok_or_else(|| {
+        tr!(
+            "没有名为「{device_name}」的设备",
+            "No device named \"{device_name}\""
+        )
+    })?;
+    let chain = jump_chain(&topology, device)?;
+    if !chain.iter().any(|hop| hop.identity_file.is_some()) {
+        return Ok(SessionPlan {
+            args,
+            temp_file: None,
+            relay: None,
+        });
+    }
+    let temp_file = write_temp_config(&chain)?;
+    let config_path = temp_file
+        .path()
+        .to_str()
+        .filter(|text| !text.is_empty() && !text.starts_with('-'))
+        .ok_or_else(|| tr!("临时 ssh 配置路径无效", "Invalid temporary ssh config path"))?
+        .to_string();
+    if config_path.chars().any(|ch| ch.is_control() || ch == '\n') {
+        return Err(tr!(
+            "临时 ssh 配置路径无效",
+            "Invalid temporary ssh config path"
+        ));
+    }
+    let mut with_file = Vec::with_capacity(args.len() + 2);
+    with_file.push("-F".to_string());
+    with_file.push(config_path);
+    with_file.extend(args);
+    Ok(SessionPlan {
+        args: with_file,
+        temp_file: Some(temp_file),
+        relay: None,
+    })
+}
+
+fn find<'a>(topology: &'a Topology, name: &str) -> Option<&'a Device> {
+    index(topology).get(name).copied()
+}
+
+/// Outermost hop first. `T → B → C` becomes `[C, B]`.
+fn jump_chain<'a>(topology: &'a Topology, target: &'a Device) -> Result<Vec<&'a Device>, String> {
+    let mut toward_outer = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(target.name.as_str());
+    let mut cursor = target;
+    while let Some(next_name) = cursor.jump.as_deref() {
+        let hop = find(topology, next_name).ok_or_else(|| {
+            tr!(
+                "区域「{}」设备「{}」：jump 指向不存在的设备「{next_name}」",
+                "Region \"{}\", device \"{}\": jump points to a missing device \"{next_name}\"",
+                region_of(topology, cursor.name.as_str()),
+                cursor.name
+            )
+        })?;
+        if !seen.insert(hop.name.as_str()) {
+            return Err(tr!(
+                "区域「{}」设备「{}」：jump 循环",
+                "Region \"{}\", device \"{}\": jump loop",
+                region_of(topology, target.name.as_str()),
+                target.name
+            ));
+        }
+        toward_outer.push(hop);
+        cursor = hop;
+    }
+    toward_outer.reverse();
+    Ok(toward_outer)
+}
+
+fn jump_spec(chain: &[&Device]) -> Result<Option<String>, String> {
+    if chain.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::with_capacity(chain.len());
+    for hop in chain {
+        parts.push(format!("{}@{}:{}", hop.user, hop.host, hop.port));
+    }
+    Ok(Some(parts.join(",")))
+}
+
+fn render_jump_config(chain: &[&Device]) -> Result<String, String> {
+    let mut body = String::new();
+    for (index, hop) in chain.iter().enumerate() {
+        let Some(key_path) = hop.identity_file.as_deref() else {
+            continue;
+        };
+        let alias = format!("mt-jump-{index}");
+        reject_config_token(&alias, &tr!("别名", "Alias"))?;
+        reject_config_token(&hop.host, "HostName")?;
+        reject_config_token(&hop.user, "User")?;
+        if hop.port == 0 {
+            return Err(tr!("端口无效", "Invalid port"));
+        }
+        // The alias is generated here. The real host is also a pattern so
+        // `-J user@host:port` still selects this block.
+        push_line(&mut body, &format!("Host {alias} {}", hop.host))?;
+        push_line(&mut body, &format!("    HostName {}", hop.host))?;
+        push_line(&mut body, &format!("    User {}", hop.user))?;
+        push_line(&mut body, &format!("    Port {}", hop.port))?;
+        push_line(&mut body, &format!("    IdentityFile {key_path}"))?;
+        body.push('\n');
+    }
+    if body.is_empty() {
+        return Err(tr!("跳板配置为空", "The jump config is empty"));
+    }
+    // `Match all` ends the Host block so Include is not nested inside it.
+    push_line(&mut body, "Match all")?;
+    push_line(&mut body, "Include ~/.ssh/config")?;
+    Ok(body)
+}
+
+fn push_line(body: &mut String, line: &str) -> Result<(), String> {
+    if line
+        .chars()
+        .any(|ch| ch == '\n' || ch == '\r' || ch.is_control())
+    {
+        return Err(tr!(
+            "ssh 配置含有控制字符",
+            "The ssh config contains control characters"
+        ));
+    }
+    body.push_str(line);
+    body.push('\n');
+    Ok(())
+}
+
+fn reject_config_token(value: &str, label: &str) -> Result<(), String> {
+    if value.is_empty() || value.starts_with('-') {
+        return Err(tr!("{label}无效", "{label} is invalid"));
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '#')
+    {
+        return Err(tr!(
+            "{label}不能包含空白、控制字符或 #",
+            "{label} cannot contain whitespace, control characters or #"
+        ));
+    }
+    Ok(())
+}
+
+fn write_temp_config(chain: &[&Device]) -> Result<TempSshConfig, String> {
+    let body = render_jump_config(chain)?;
+    let (path, mut file) = create_temp_file()?;
+    if file
+        .write_all(body.as_bytes())
+        .and_then(|_| file.sync_all())
+        .is_err()
+    {
+        drop(file);
+        let _ = fs::remove_file(&path);
+        return Err(tr!(
+            "无法写入临时 ssh 配置",
+            "Could not write the temporary ssh config"
+        ));
+    }
+    drop(file);
+    if let Err(err) = restrict_to_current_user(&path) {
+        let _ = fs::remove_file(&path);
+        return Err(err);
+    }
+    Ok(TempSshConfig { path, armed: true })
+}
+
+fn create_temp_file() -> Result<(PathBuf, std::fs::File), String> {
+    for _ in 0..8 {
+        let path = temp_config_path();
+        match create_private(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(_) if path.exists() => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(tr!(
+        "无法创建临时 ssh 配置",
+        "Could not create the temporary ssh config"
+    ))
+}
+
+fn temp_config_path() -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("starhop-ssh-{nanos}-{n}.conf"))
+}
+
+#[cfg(unix)]
+fn create_private(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|_| {
+            tr!(
+                "无法创建临时 ssh 配置",
+                "Could not create the temporary ssh config"
+            )
+        })
+}
+
+#[cfg(windows)]
+fn create_private(path: &Path) -> Result<std::fs::File, String> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| {
+            tr!(
+                "无法创建临时 ssh 配置",
+                "Could not create the temporary ssh config"
+            )
+        })
+}
+
+#[cfg(unix)]
+fn restrict_to_current_user(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| {
+        tr!(
+            "无法限制临时 ssh 配置的访问权限",
+            "Could not restrict access to the temporary ssh config"
+        )
+    })
+}
+
+/// Best effort: drop inherited ACEs, grant the current user, and remove the
+/// well-known Everyone / Authenticated Users / Users SIDs. `icacls.exe` is
+/// `%SystemRoot%\System32\icacls.exe` (SystemRoot is read the same way as
+/// `session/binary.rs`) and is spawned directly, not through a shell, with
+/// `CREATE_NO_WINDOW`. The caller deletes the file if this fails.
+#[cfg(windows)]
+fn restrict_to_current_user(path: &Path) -> Result<(), String> {
+    let user = std::env::var("USERNAME").map_err(|_| {
+        tr!(
+            "无法限制临时 ssh 配置的访问权限",
+            "Could not restrict access to the temporary ssh config"
+        )
+    })?;
+    if user.is_empty()
+        || user.chars().any(|ch| {
+            ch.is_control() || ch.is_whitespace() || matches!(ch, '"' | '%' | '&' | '|' | '<' | '>')
+        })
+    {
+        return Err(tr!(
+            "无法限制临时 ssh 配置的访问权限",
+            "Could not restrict access to the temporary ssh config"
+        ));
+    }
+    let status = icacls_command()
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:(F)"))
+        .status()
+        .map_err(|_| {
+            tr!(
+                "无法限制临时 ssh 配置的访问权限",
+                "Could not restrict access to the temporary ssh config"
+            )
+        })?;
+    if !status.success() {
+        return Err(tr!(
+            "无法限制临时 ssh 配置的访问权限",
+            "Could not restrict access to the temporary ssh config"
+        ));
+    }
+    // Missing SIDs make icacls exit non-zero. That is still a tighter file
+    // than the default DACL, so these removals are best-effort.
+    let _ = icacls_command()
+        .arg(path)
+        .arg("/remove:g")
+        .arg("*S-1-1-0")
+        .arg("*S-1-5-11")
+        .arg("*S-1-5-32-545")
+        .status();
+    Ok(())
+}
+
+/// Absolute `icacls.exe` plus `CREATE_NO_WINDOW`, so a GUI session does not
+/// flash a console. SystemRoot falls back to `C:\Windows`, matching
+/// `session/binary.rs`.
+#[cfg(windows)]
+fn icacls_command() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let mut command = std::process::Command::new(root.join("System32").join("icacls.exe"));
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Topology {
+        super::super::parse_topology(include_str!("../../tests/fixtures/topology.valid.json"))
+            .expect("fixture")
+    }
+
+    #[test]
+    fn jump_config_is_private_and_removed_on_drop() {
+        let topology = sample();
+        let plan = plan_device_session_from(&topology, "内网服务器").unwrap();
+        let temp = plan.temp_file.expect("jump hop names a key path");
+        let path = temp.path().to_path_buf();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Host mt-jump-0 jump.example.com\n"));
+        assert!(text.contains("    HostName jump.example.com\n"));
+        assert!(text.contains("    User me\n"));
+        assert!(text.contains("    Port 2222\n"));
+        assert!(text.contains("~/.ssh/id_example\n"));
+        assert!(text.contains("Match all\nInclude ~/.ssh/config\n"));
+        assert!(!text.to_lowercase().contains("proxycommand"));
+        assert!(text.find("Host ").unwrap() < text.find("Match all").unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(temp);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn plain_device_does_not_create_a_config_file() {
+        let topology = sample();
+        let plan = plan_device_session_from(&topology, "示例路由器").unwrap();
+        assert!(plan.temp_file.is_none());
+        assert!(!plan.args.iter().any(|arg| arg == "-F"));
+    }
+
+    fn plan_device_session_from(_topology: &Topology, name: &str) -> Result<SessionPlan, String> {
+        let dir = std::env::temp_dir().join(format!(
+            "starhop-topology-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("topology.json"),
+            include_str!("../../tests/fixtures/topology.valid.json"),
+        )
+        .unwrap();
+        let plan = plan_device_session(&dir, name);
+        let _ = fs::remove_dir_all(&dir);
+        plan
+    }
+
+    static NEXT_TEST: AtomicU64 = AtomicU64::new(1);
+}

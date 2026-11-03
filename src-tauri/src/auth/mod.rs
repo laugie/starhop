@@ -1,0 +1,738 @@
+//! Startup login lock.
+//!
+//! The hash and the failure counter live in one system-credential entry.
+//! Unlocking is remembered only in this process: a restart asks again.
+
+mod hash;
+mod store;
+mod throttle;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use hash::{hash_secret, verify_secret, HashParams};
+use serde::Serialize;
+use store::Record;
+use tauri::Manager;
+use throttle::{delay_for_failures, duration_ms, observe, remaining, Deadline};
+
+pub use store::{KeyringStore, MemoryStore, RenamedStore, SecretStore, StoreError};
+pub use throttle::{Clock, FakeClock, SystemClock};
+
+const USERNAME_MAX_CHARS: usize = 64;
+const SECRET_MIN_CHARS: usize = 8;
+
+/// What the login screen should show. `Unlocked` is only true in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthStatus {
+    NeedsSetup,
+    Locked,
+    Unlocked,
+    Unavailable,
+}
+
+/// Why a setup or login attempt was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginError {
+    BadCredentials,
+    Throttled { remaining: Duration },
+    Unavailable,
+    InvalidInput { message: String },
+    AlreadySet,
+    Locked,
+}
+
+impl std::fmt::Display for LoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoginError::BadCredentials => {
+                f.write_str(&crate::tr!("用户名或密码错误", "Wrong username or password"))
+            }
+            LoginError::Throttled { remaining } => {
+                let seconds = remaining.as_secs().max(1);
+                f.write_str(&crate::tr!(
+                    "请等待 {seconds} 秒",
+                    "Wait {seconds} seconds and try again"
+                ))
+            }
+            LoginError::Unavailable => f.write_str(&unavailable_message()),
+            LoginError::InvalidInput { message } => f.write_str(message),
+            LoginError::AlreadySet => f.write_str(&crate::tr!(
+                "已经设置过，请直接登录",
+                "A login is already set up; sign in instead"
+            )),
+            LoginError::Locked => f.write_str(&crate::tr!("需要登录", "Sign in first")),
+        }
+    }
+}
+
+/// Public view of the lock switch. It never includes the hash or the secret.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockSettings {
+    pub login_lock_enabled: bool,
+    pub has_secret: bool,
+    pub read_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Public view of the lock. It never includes the hash or the secret.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthSnapshot {
+    pub state: String,
+    pub retry_after_ms: u64,
+    pub message: Option<String>,
+}
+
+/// Login lock over a [`SecretStore`] and a [`Clock`].
+pub struct AuthService<S = MemoryStore, C = FakeClock> {
+    store: Arc<S>,
+    clock: Arc<C>,
+    unlocked: Mutex<bool>,
+    /// Process gate. False skips the unlock check. Loaded once at startup
+    /// through [`Self::set_lock_enabled`], which does not change the unlock flag.
+    /// Turning the switch off clears the gate immediately. Turning it on from
+    /// off, via [`Self::set_lock`], marks this process unlocked so the current
+    /// session keeps working. Turning it on when it was already on leaves the
+    /// unlock flag unchanged. The next launch reads the saved value and asks again.
+    gate_enabled: Mutex<bool>,
+    /// Serializes setup, login, and verify. Held only inside those synchronous
+    /// methods, which commands run on a blocking thread, so it never crosses `.await`.
+    attempt: Mutex<()>,
+    params: HashParams,
+}
+
+impl<S, C> AuthService<S, C>
+where
+    S: SecretStore,
+    C: Clock,
+{
+    /// Constructor used by the contract tests. Hashing uses the fast parameters.
+    pub fn new(store: Arc<S>, clock: Arc<C>) -> Self {
+        Self::with_params(store, clock, HashParams::fast())
+    }
+
+    /// Constructor used by the running app. Hashing uses the OWASP parameters.
+    pub fn production(store: Arc<S>, clock: Arc<C>) -> Self {
+        Self::with_params(store, clock, HashParams::production())
+    }
+
+    fn with_params(store: Arc<S>, clock: Arc<C>, params: HashParams) -> Self {
+        Self {
+            store,
+            clock,
+            unlocked: Mutex::new(false),
+            gate_enabled: Mutex::new(false),
+            attempt: Mutex::new(()),
+            params,
+        }
+    }
+
+    pub fn lock_enabled(&self) -> bool {
+        match self.gate_enabled.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    pub fn set_lock_enabled(&self, enabled: bool) {
+        match self.gate_enabled.lock() {
+            Ok(mut guard) => *guard = enabled,
+            Err(poisoned) => *poisoned.into_inner() = enabled,
+        }
+    }
+
+    /// Apply the in-memory gate.
+    ///
+    /// The attempt lock is held across the read of the previous value and the
+    /// write. Enabling a gate that was off marks this process unlocked so the
+    /// current session keeps working. Enabling a gate that was already on does
+    /// not change the unlock flag, so a locked process cannot unlock itself by
+    /// setting the switch again. Disabling never changes the unlock flag.
+    pub fn set_lock(&self, enabled: bool) -> Result<(), LoginError> {
+        let _attempt = self.lock_attempt();
+        let was_enabled = self.lock_enabled();
+        self.set_lock_enabled(enabled);
+        if enabled && !was_enabled {
+            self.set_unlocked(true);
+        }
+        Ok(())
+    }
+
+    pub fn status(&self) -> AuthStatus {
+        match self.read_record() {
+            Err(_) => AuthStatus::Unavailable,
+            Ok(None) => AuthStatus::NeedsSetup,
+            Ok(Some(_)) => {
+                if self.is_unlocked() {
+                    AuthStatus::Unlocked
+                } else {
+                    AuthStatus::Locked
+                }
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> AuthSnapshot {
+        let status = self.status();
+        let retry_after_ms = self.retry_after().as_millis() as u64;
+        let message = match status {
+            AuthStatus::Unavailable => Some(unavailable_message()),
+            _ => None,
+        };
+        AuthSnapshot {
+            state: status_name(status).to_string(),
+            retry_after_ms,
+            message,
+        }
+    }
+
+    pub fn retry_after(&self) -> Duration {
+        let Ok(Some(record)) = self.read_record() else {
+            return Duration::ZERO;
+        };
+        let deadline = Deadline {
+            not_before_ms: record.not_before_ms,
+            last_seen_ms: record.last_seen_ms,
+        };
+        remaining(&deadline, self.clock.now_ms())
+    }
+
+    /// Forget the in-memory unlock. The stored hash and failure counter stay.
+    pub fn lock(&self) {
+        self.set_unlocked(false);
+    }
+
+    pub fn setup(&self, username: &str, secret: &str, confirm: &str) -> Result<(), LoginError> {
+        let _attempt = self.lock_attempt();
+        validate_new_credentials(username, secret, confirm)?;
+        // Read again under the attempt lock so a concurrent setup cannot both
+        // observe an empty store and both write.
+        if self.read_record()?.is_some() {
+            return Err(LoginError::AlreadySet);
+        }
+        let phc = hash_secret(self.params, secret).map_err(|_| LoginError::Unavailable)?;
+        let now = self.clock.now_ms();
+        let record = Record {
+            username: username.to_string(),
+            phc,
+            failures: 0,
+            not_before_ms: 0,
+            last_seen_ms: now,
+        };
+        self.write_record(&record)?;
+        self.set_unlocked(true);
+        Ok(())
+    }
+
+    pub fn login(&self, username: &str, secret: &str) -> Result<(), LoginError> {
+        let _attempt = self.lock_attempt();
+        // Read the record and the remaining wait only after the attempt lock
+        // is held, so overlapping callers share one failure counter.
+        let Some(record) = self.read_record()? else {
+            return Err(LoginError::BadCredentials);
+        };
+        self.authenticate(record, username, secret, true)
+    }
+
+    /// Check the current username and secret before the lock is turned off.
+    ///
+    /// Uses the same attempt lock and failure counter as [`Self::login`].
+    /// No stored record means there is nothing to check. Success leaves the
+    /// hash, the failure counter, and the in-memory unlock flag unchanged.
+    pub fn verify_current(&self, username: &str, secret: &str) -> Result<(), LoginError> {
+        let _attempt = self.lock_attempt();
+        let Some(record) = self.read_record()? else {
+            return Ok(());
+        };
+        self.authenticate(record, username, secret, false)
+    }
+
+    fn authenticate(
+        &self,
+        mut record: Record,
+        username: &str,
+        secret: &str,
+        unlock_on_success: bool,
+    ) -> Result<(), LoginError> {
+        let now = self.clock.now_ms();
+        let mut deadline = Deadline {
+            not_before_ms: record.not_before_ms,
+            last_seen_ms: record.last_seen_ms,
+        };
+        observe(&mut deadline, now);
+        let wait = remaining(&deadline, now);
+        if !wait.is_zero() {
+            record.not_before_ms = deadline.not_before_ms;
+            record.last_seen_ms = deadline.last_seen_ms;
+            self.write_record(&record)?;
+            return Err(LoginError::Throttled { remaining: wait });
+        }
+        // Always run the hash check so a wrong username is not a faster answer.
+        let secret_ok = verify_secret(&record.phc, secret);
+        let username_ok = record.username == username;
+        if !(username_ok && secret_ok) {
+            record.failures = record.failures.saturating_add(1);
+            record.last_seen_ms = now;
+            if let Some(delay) = delay_for_failures(record.failures) {
+                record.not_before_ms = now.saturating_add(duration_ms(delay));
+            } else {
+                record.not_before_ms = deadline.not_before_ms;
+            }
+            self.write_record(&record)?;
+            return Err(LoginError::BadCredentials);
+        }
+        if unlock_on_success {
+            record.failures = 0;
+            record.not_before_ms = 0;
+            record.last_seen_ms = now;
+            self.write_record(&record)?;
+            self.set_unlocked(true);
+        }
+        Ok(())
+    }
+
+    fn has_secret(&self) -> Result<bool, LoginError> {
+        Ok(self.read_record()?.is_some())
+    }
+
+    fn lock_attempt(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.attempt.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn is_unlocked(&self) -> bool {
+        match self.unlocked.lock() {
+            Ok(guard) => *guard,
+            Err(_) => false,
+        }
+    }
+
+    fn set_unlocked(&self, unlocked: bool) {
+        match self.unlocked.lock() {
+            Ok(mut guard) => *guard = unlocked,
+            Err(poisoned) => *poisoned.into_inner() = unlocked,
+        }
+    }
+
+    fn read_record(&self) -> Result<Option<Record>, LoginError> {
+        match self.store.load() {
+            Ok(None) => Ok(None),
+            Ok(Some(raw)) => match serde_json::from_str(&raw) {
+                Ok(record) => Ok(Some(record)),
+                Err(_) => Err(LoginError::Unavailable),
+            },
+            Err(StoreError) => Err(LoginError::Unavailable),
+        }
+    }
+
+    fn write_record(&self, record: &Record) -> Result<(), LoginError> {
+        let raw = serde_json::to_string(record).map_err(|_| LoginError::Unavailable)?;
+        self.store.save(&raw).map_err(|_| LoginError::Unavailable)
+    }
+}
+
+/// Block host and session commands until this process has logged in.
+pub fn require_unlocked<S, C>(service: &AuthService<S, C>) -> Result<(), LoginError>
+where
+    S: SecretStore,
+    C: Clock,
+{
+    if service.is_unlocked() {
+        Ok(())
+    } else {
+        Err(LoginError::Locked)
+    }
+}
+
+/// Gate used by host, session, and topology commands.
+///
+/// A disabled lock allows the call. An enabled lock is the same check as
+/// [`require_unlocked`]: fail closed until this process has logged in.
+pub fn require_access<S, C>(
+    service: &AuthService<S, C>,
+    lock_enabled: bool,
+) -> Result<(), LoginError>
+where
+    S: SecretStore,
+    C: Clock,
+{
+    if !lock_enabled {
+        return Ok(());
+    }
+    require_unlocked(service)
+}
+
+/// Where startup should go. A disabled lock always opens the home page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRoute {
+    Home,
+    Login,
+    Setup,
+    Unavailable,
+}
+
+pub fn startup_route<S, C>(service: &AuthService<S, C>, lock_enabled: bool) -> StartupRoute
+where
+    S: SecretStore,
+    C: Clock,
+{
+    if !lock_enabled {
+        return StartupRoute::Home;
+    }
+    match service.status() {
+        AuthStatus::NeedsSetup => StartupRoute::Setup,
+        AuthStatus::Locked => StartupRoute::Login,
+        AuthStatus::Unlocked => StartupRoute::Home,
+        AuthStatus::Unavailable => StartupRoute::Unavailable,
+    }
+}
+
+fn validate_new_credentials(username: &str, secret: &str, confirm: &str) -> Result<(), LoginError> {
+    let username_len = username.chars().count();
+    if username_len == 0 || username_len > USERNAME_MAX_CHARS {
+        return Err(LoginError::InvalidInput {
+            message: crate::tr!("用户名需要 1 到 64 个字符", "The username needs 1 to 64 characters"),
+        });
+    }
+    if secret != confirm {
+        return Err(LoginError::InvalidInput {
+            message: crate::tr!("两次输入的密码不一致", "The passwords do not match"),
+        });
+    }
+    if secret.chars().count() < SECRET_MIN_CHARS {
+        return Err(LoginError::InvalidInput {
+            message: crate::tr!("密码至少 8 个字符", "The password needs at least 8 characters"),
+        });
+    }
+    Ok(())
+}
+
+fn unavailable_message() -> String {
+    crate::tr!("无法读取系统凭据库", "Could not read the system credential store")
+}
+
+fn status_name(status: AuthStatus) -> &'static str {
+    match status {
+        AuthStatus::NeedsSetup => "needsSetup",
+        AuthStatus::Locked => "locked",
+        AuthStatus::Unlocked => "unlocked",
+        AuthStatus::Unavailable => "unavailable",
+    }
+}
+
+/// Process-wide lock. Commands receive this as Tauri state.
+pub type AuthState = AuthService<RenamedStore<KeyringStore, KeyringStore>, SystemClock>;
+
+pub fn open_state() -> AuthState {
+    AuthService::production(Arc::new(KeyringStore::open_with_legacy()), Arc::new(SystemClock))
+}
+
+/// Read the lock without returning the hash.
+#[tauri::command]
+pub async fn auth_status(app: tauri::AppHandle) -> Result<AuthSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AuthState>();
+        Ok(state.snapshot())
+    })
+    .await
+    .map_err(|_| unavailable_message())?
+}
+
+/// First-run setup. A matching confirm and a long enough secret are required.
+///
+/// Argon2 and the credential write run on a blocking thread. The service lock
+/// is not held across `.await`.
+#[tauri::command]
+pub async fn auth_setup(
+    app: tauri::AppHandle,
+    username: String,
+    secret: String,
+    confirm: String,
+) -> Result<AuthSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AuthState>();
+        state
+            .setup(&username, &secret, &confirm)
+            .map_err(|err| err.to_string())?;
+        Ok(state.snapshot())
+    })
+    .await
+    .map_err(|_| crate::tr!("无法保存凭据", "Could not save the login"))?
+}
+
+/// Check the username and secret. Wrong values share one error string.
+///
+/// Argon2 and the credential read run on a blocking thread. The service lock
+/// is not held across `.await`.
+#[tauri::command]
+pub async fn auth_login(
+    app: tauri::AppHandle,
+    username: String,
+    secret: String,
+) -> Result<AuthSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AuthState>();
+        state
+            .login(&username, &secret)
+            .map_err(|err| err.to_string())?;
+        Ok(state.snapshot())
+    })
+    .await
+    .map_err(|_| crate::tr!("登录失败", "Sign-in failed"))?
+}
+
+/// Read the lock switch and whether a secret has already been stored.
+///
+/// The config read runs on a blocking thread. No lock is held across `.await`.
+#[tauri::command]
+pub async fn auth_settings(app: tauri::AppHandle) -> Result<LockSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || read_lock_settings(&app))
+        .await
+        .map_err(|_| crate::tr!("无法读取设置", "Could not read the settings"))?
+}
+
+/// Turn the startup lock on or off.
+///
+/// Turning it off when a secret exists requires `username` and `secret`.
+/// A wrong pair counts toward the same delay as login and shares its attempt
+/// lock. The hash is not removed.
+///
+/// Turning it on keeps this process usable only when the gate was previously
+/// off. If the gate was already on, the unlock flag stays as it is, so a
+/// locked process cannot unlock itself by setting the switch again.
+/// Disk writes run on a blocking thread. `verify_current` releases the attempt
+/// lock before [`AuthService::set_lock`] takes it again, and that lock does
+/// not cross `.await`.
+#[tauri::command]
+pub async fn auth_set_lock(
+    app: tauri::AppHandle,
+    enabled: bool,
+    username: Option<String>,
+    secret: Option<String>,
+) -> Result<LockSettings, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AuthState>();
+        if enabled {
+            if !state.has_secret().map_err(|err| err.to_string())? {
+                return Err(crate::tr!(
+                    "请先设置用户名和口令",
+                    "Set a username and password first"
+                ));
+            }
+        } else {
+            state
+                .verify_current(
+                    username.as_deref().unwrap_or(""),
+                    secret.as_deref().unwrap_or(""),
+                )
+                .map_err(|err| err.to_string())?;
+        }
+        app.state::<crate::hosts::HostState>()
+            .set_login_lock_enabled(enabled)?;
+        state.set_lock(enabled).map_err(|err| err.to_string())?;
+        read_lock_settings(&app)
+    })
+    .await
+    .map_err(|_| crate::tr!("无法保存设置", "Could not save the setting"))?
+}
+
+fn read_lock_settings(app: &tauri::AppHandle) -> Result<LockSettings, String> {
+    let view = app
+        .state::<crate::hosts::HostState>()
+        .login_lock_view()?;
+    let has_secret = app
+        .state::<AuthState>()
+        .has_secret()
+        .map_err(|err| err.to_string())?;
+    Ok(LockSettings {
+        login_lock_enabled: view.enabled,
+        has_secret,
+        read_only: view.read_only,
+        message: view.message,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use super::*;
+
+    fn token(tag: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        format!("{tag}-{nanos:x}-{:x}", std::process::id())
+    }
+
+    fn fresh() -> AuthService<MemoryStore, FakeClock> {
+        AuthService::new(
+            Arc::new(MemoryStore::default()),
+            Arc::new(FakeClock::default()),
+        )
+    }
+
+    #[test]
+    fn production_constructor_keeps_the_owasp_parameters() {
+        let service = AuthService::production(
+            Arc::new(MemoryStore::default()),
+            Arc::new(FakeClock::default()),
+        );
+        assert_eq!(service.params, HashParams::production());
+        assert_eq!(service.params.memory_kib, 19 * 1024);
+        assert_eq!(service.params.time_cost, 2);
+        assert_eq!(service.params.parallelism, 1);
+    }
+
+    #[test]
+    fn username_and_secret_lengths_follow_the_limits() {
+        let service = fresh();
+        let secret = token("p");
+        let mut long_name = token("u");
+        while long_name.chars().count() < 65 {
+            long_name.push('x');
+        }
+        assert!(service.setup(&long_name, &secret, &secret).is_err());
+        let name64: String = long_name.chars().take(64).collect();
+        let eight: String = secret.chars().take(8).collect();
+        service.setup(&name64, &eight, &eight).expect("64 and 8");
+        let other = fresh();
+        let seven: String = secret.chars().take(7).collect();
+        assert!(other.setup(&token("u"), &seven, &seven).is_err());
+    }
+
+    #[test]
+    fn rollback_does_not_change_the_remaining_wait() {
+        let clock = Arc::new(FakeClock::default());
+        let service = AuthService::new(Arc::new(MemoryStore::default()), Arc::clone(&clock));
+        let username = token("u");
+        let secret = token("p");
+        service.setup(&username, &secret, &secret).unwrap();
+        service.lock();
+        for _ in 0..5 {
+            let _ = service.login(&username, &token("no"));
+        }
+        let before = match service.login(&username, &secret) {
+            Err(LoginError::Throttled { remaining }) => remaining,
+            other => panic!("expected throttle, got {other:?}"),
+        };
+        clock.rewind(Duration::from_secs(3600));
+        let after = match service.login(&username, &secret) {
+            Err(LoginError::Throttled { remaining }) => remaining,
+            other => panic!("expected throttle, got {other:?}"),
+        };
+        assert_eq!(before, after);
+        assert!(after > Duration::from_secs(29));
+    }
+
+    /// Wrong attempts that overlap must not each get a free verification.
+    /// At most five return [`LoginError::BadCredentials`]; the rest are throttled.
+    /// The stored counter matches the number of attempts that were actually checked.
+    #[test]
+    fn concurrent_wrong_logins_share_one_failure_counter() {
+        const THREADS: usize = 16;
+        let store = Arc::new(MemoryStore::default());
+        let service = Arc::new(AuthService::production(
+            Arc::clone(&store),
+            Arc::new(FakeClock::default()),
+        ));
+        let username = "u-test";
+        let secret = "correct-horse-1";
+        service.setup(username, secret, secret).unwrap();
+        service.lock();
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for i in 0..THREADS {
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                service.login(username, &format!("wrong-{i:04}"))
+            }));
+        }
+        let mut bad = 0u32;
+        let mut throttled = 0usize;
+        for handle in handles {
+            match handle.join().expect("login thread") {
+                Err(LoginError::BadCredentials) => bad += 1,
+                Err(LoginError::Throttled { .. }) => throttled += 1,
+                other => panic!("unexpected login result: {other:?}"),
+            }
+        }
+        assert!(bad <= 5, "checked {bad} guesses, throttled {throttled}");
+        assert_eq!(bad as usize + throttled, THREADS);
+        let record: super::store::Record =
+            serde_json::from_str(&store.dump_all()).expect("stored record");
+        assert_eq!(record.failures, bad);
+    }
+
+    /// Two first-run writes must not both succeed. The later one is AlreadySet.
+    #[test]
+    fn concurrent_setup_allows_only_one_success() {
+        const THREADS: usize = 16;
+        let service = Arc::new(AuthService::production(
+            Arc::new(MemoryStore::default()),
+            Arc::new(FakeClock::default()),
+        ));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let service = Arc::clone(&service);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                service.setup("u-test", "correct-horse-1", "correct-horse-1")
+            }));
+        }
+        let mut ok = 0usize;
+        let mut already = 0usize;
+        for handle in handles {
+            match handle.join().expect("setup thread") {
+                Ok(()) => ok += 1,
+                Err(LoginError::AlreadySet) => already += 1,
+                Err(other) => panic!("unexpected setup result: {other}"),
+            }
+        }
+        assert_eq!(ok, 1, "ok={ok} already={already}");
+        assert_eq!(already, THREADS - 1);
+    }
+
+    /// 开关已经开着、口令已设、当前进程还没登录时，再次打开不能解锁。
+    #[test]
+    fn set_lock_on_while_already_enabled_does_not_unlock() {
+        let service = fresh();
+        let (username, secret) = (token("u"), token("p"));
+        service.setup(&username, &secret, &secret).unwrap();
+        service.lock();
+        service.set_lock_enabled(true);
+        assert!(!service.is_unlocked());
+        assert!(require_access(&service, true).is_err());
+
+        let _ = service.set_lock(true);
+
+        assert!(service.lock_enabled());
+        assert!(!service.is_unlocked(), "未登录时再次打开开关不能变成已解锁");
+        assert!(require_access(&service, service.lock_enabled()).is_err());
+    }
+
+    /// 开关从关到开：当前进程保持可用，下次启动才要求登录。
+    #[test]
+    fn set_lock_on_from_off_unlocks_this_process() {
+        let service = fresh();
+        let (username, secret) = (token("u"), token("p"));
+        service.setup(&username, &secret, &secret).unwrap();
+        service.lock();
+        assert!(!service.lock_enabled());
+        assert!(!service.is_unlocked());
+
+        service.set_lock(true).expect("从关到开");
+
+        assert!(service.lock_enabled());
+        assert!(service.is_unlocked());
+        assert!(require_access(&service, service.lock_enabled()).is_ok());
+    }
+}

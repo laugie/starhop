@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/laugie/starhop/discussions
+    about: Ask how to do something or share an idea.
+  - name: Security vulnerability
+    url: https://github.com/laugie/starhop/security/advisories/new
+    about: Report it privately, not as an issue.

@@ -1,0 +1,9 @@
+[[permission]]
+identifier = "allow-locale-sync"
+description = "Enables the locale_sync command without any pre-configured scope."
+commands.allow = ["locale_sync"]
+
+[[permission]]
+identifier = "allow-locale-set"
+description = "Enables the locale_set command without any pre-configured scope."
+commands.allow = ["locale_set"]

@@ -1,0 +1,324 @@
+mod exec;
+pub(crate) use exec::summarize_cli_text;
+mod list;
+mod parse;
+pub mod ssh_config;
+mod store;
+
+use std::path::Path;
+use std::sync::Mutex;
+
+use tauri::Manager;
+
+pub use exec::tailscale_status;
+pub use list::{compose_list, HostEntry, ListHostsResponse};
+pub use parse::{parse_status, ParseError, TailnetStatus};
+pub use store::{validate_manual_input, HostStore, ManualHost, MemoryHostStore, NewManualHost};
+
+pub(crate) use exec::RunOutput;
+use parse::TailscalePeer;
+
+/// Whether a topology address matched a Tailscale peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressPresence {
+    Online,
+    Offline,
+    Unknown,
+}
+
+/// Peer addresses from one `tailscale status --json` run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailscaleDirectory {
+    readable: bool,
+    peers: Vec<DirectoryPeer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectoryPeer {
+    online: bool,
+    keys: Vec<String>,
+}
+
+impl TailscaleDirectory {
+    /// Run the same status command the host list uses.
+    pub fn read() -> Self {
+        Self::from_output(&tailscale_status())
+    }
+
+    pub fn from_output(output: &RunOutput) -> Self {
+        let RunOutput::Finished { stdout, .. } = output else {
+            return Self {
+                readable: false,
+                peers: Vec::new(),
+            };
+        };
+        let status = match parse_status(stdout) {
+            Ok(status) => status,
+            Err(_) => {
+                return Self {
+                    readable: false,
+                    peers: Vec::new(),
+                };
+            }
+        };
+        let raw: serde_json::Value =
+            serde_json::from_str(stdout).unwrap_or(serde_json::Value::Null);
+        let peers = status
+            .peers
+            .iter()
+            .map(|peer| DirectoryPeer {
+                online: peer.online,
+                keys: peer_match_keys(&raw, peer),
+            })
+            .collect();
+        Self {
+            readable: true,
+            peers,
+        }
+    }
+
+    pub fn presence(&self, address: &str) -> AddressPresence {
+        if !self.readable {
+            return AddressPresence::Unknown;
+        }
+        let needle = normalize_match_key(address);
+        if needle.is_empty() {
+            return AddressPresence::Unknown;
+        }
+        for peer in &self.peers {
+            if peer.keys.iter().any(|key| key == &needle) {
+                return if peer.online {
+                    AddressPresence::Online
+                } else {
+                    AddressPresence::Offline
+                };
+            }
+        }
+        AddressPresence::Unknown
+    }
+}
+
+fn normalize_match_key(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn peer_match_keys(raw: &serde_json::Value, peer: &TailscalePeer) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut push = |value: &str| {
+        let key = normalize_match_key(value);
+        if !key.is_empty() && !keys.contains(&key) {
+            keys.push(key);
+        }
+    };
+    if let Some(dns) = &peer.dns_name {
+        push(dns);
+    }
+    if let Some(ip) = &peer.ip {
+        push(ip);
+    }
+    if let Some(ipv4) = &peer.ipv4 {
+        push(ipv4);
+    }
+    if let Some(node) = raw.get("Peer").and_then(|peers| peers.get(&peer.node_id)) {
+        if let Some(dns) = node.get("DNSName").and_then(|value| value.as_str()) {
+            push(dns);
+        }
+        if let Some(ips) = node.get("TailscaleIPs").and_then(|value| value.as_array()) {
+            for ip in ips {
+                if let Some(text) = ip.as_str() {
+                    push(text);
+                }
+            }
+        }
+    }
+    keys
+}
+
+use crate::config::JsonHostStore;
+use list::compose_list as build_list;
+
+/// Manual servers loaded from the local JSON config.
+pub struct HostState {
+    store: Mutex<JsonHostStore>,
+}
+
+impl HostState {
+    pub fn open(dir: &Path) -> Self {
+        Self {
+            store: Mutex::new(JsonHostStore::open(dir)),
+        }
+    }
+
+    pub fn login_lock_view(&self) -> Result<crate::config::LoginLockView, String> {
+        self.with_store(|store| store.login_lock_view())
+    }
+
+    pub fn set_login_lock_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.with_store(|store| store.set_login_lock_enabled(enabled))?
+    }
+
+    pub fn ui_zoom_view(&self) -> Result<crate::config::ZoomView, String> {
+        self.with_store(|store| store.ui_zoom_view())
+    }
+
+    pub fn set_ui_zoom(&self, percent: u16) -> Result<(), String> {
+        self.with_store(|store| store.set_ui_zoom(percent))?
+    }
+
+    pub fn appearance_view(&self) -> Result<crate::config::AppearanceView, String> {
+        self.with_store(|store| store.appearance_view())
+    }
+
+    pub fn set_appearance(&self, theme: Option<&str>, font: Option<&str>) -> Result<(), String> {
+        self.with_store(|store| store.set_appearance(theme, font))?
+    }
+
+    pub fn set_topology_mode(&self, mode: &str) -> Result<(), String> {
+        self.with_store(|store| store.set_topology_mode(mode))?
+    }
+
+    pub fn set_auto_beautify(&self, enabled: bool) -> Result<(), String> {
+        self.with_store(|store| store.set_auto_beautify(enabled))?
+    }
+
+    pub fn language_setting(&self) -> Result<(Option<String>, bool), String> {
+        self.with_store(|store| store.language_setting())
+    }
+
+    pub fn set_language(&self, language: Option<&str>) -> Result<(), String> {
+        self.with_store(|store| store.set_language(language))?
+    }
+
+    fn with_store<T>(&self, f: impl FnOnce(&mut JsonHostStore) -> T) -> Result<T, String> {
+        let mut guard = self
+            .store
+            .lock()
+            .map_err(|_| tr!("内部状态不可用", "Internal state unavailable"))?;
+        Ok(f(&mut guard))
+    }
+}
+
+/// Read Tailscale once and merge the result with manual servers.
+///
+/// Manual servers are cloned before the CLI runs, so the store lock is not
+/// held across the await. The process itself runs on a blocking thread.
+#[tauri::command]
+pub async fn list_hosts(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, HostState>,
+) -> Result<ListHostsResponse, String> {
+    {
+        let auth = app.state::<crate::auth::AuthState>();
+        crate::auth::require_access(&auth, auth.lock_enabled())
+    }
+        .map_err(|err| err.to_string())?;
+    let (manuals, notice) = state.with_store(|store| {
+        let notice = store.notice().map(ToOwned::to_owned);
+        (store.list(), notice)
+    })?;
+    let output = tauri::async_runtime::spawn_blocking(tailscale_status)
+        .await
+        .map_err(|_| tr!("读取 Tailscale 状态失败", "Failed to read Tailscale status"))?;
+    let mut listed = build_list(&output, &manuals);
+    listed.config_notice = notice;
+    Ok(listed)
+}
+
+/// Validate, remember, and immediately save a manual server.
+///
+/// 碰磁盘或外部进程的 Tauri 命令一律 async，避免阻塞主线程。
+/// 写盘放在 `spawn_blocking` 里；锁只在该闭包内持有，不跨 `.await`。
+#[tauri::command]
+pub async fn add_manual_host(
+    app: tauri::AppHandle,
+    name: String,
+    host: String,
+    user: Option<String>,
+    port: Option<u32>,
+) -> Result<ManualHost, String> {
+    {
+        let auth = app.state::<crate::auth::AuthState>();
+        crate::auth::require_access(&auth, auth.lock_enabled())
+    }
+        .map_err(|err| err.to_string())?;
+    let validated = validate_manual_input(&name, &host, user.as_deref(), port)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<HostState>();
+        state.with_store(|store| store.add(validated))?
+    })
+    .await
+    .map_err(|_| tr!("保存服务器失败", "Failed to save the server"))?
+}
+
+/// Drop a manual server by the id returned when it was added.
+///
+/// 碰磁盘或外部进程的 Tauri 命令一律 async，避免阻塞主线程。
+/// 写盘放在 `spawn_blocking` 里；锁只在该闭包内持有，不跨 `.await`。
+#[tauri::command]
+pub async fn remove_manual_host(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    {
+        let auth = app.state::<crate::auth::AuthState>();
+        crate::auth::require_access(&auth, auth.lock_enabled())
+    }
+        .map_err(|err| err.to_string())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<HostState>();
+        state.with_store(|store| store.remove(&id))?
+    })
+    .await
+    .map_err(|_| tr!("移除服务器失败", "Failed to remove the server"))?
+}
+
+/// Host aliases from `~/.ssh/config` (and its includes) for the import list.
+/// Read only; the caller adds the chosen ones as manual servers.
+#[tauri::command]
+pub async fn ssh_config_hosts(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+    {
+        let auth = app.state::<crate::auth::AuthState>();
+        crate::auth::require_access(&auth, auth.lock_enabled())
+    }
+    .map_err(|err| err.to_string())?;
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|_| tr!("找不到用户主目录", "Could not find the home folder"))?;
+    tauri::async_runtime::spawn_blocking(move || ssh_config::aliases_in_home(&home))
+        .await
+        .map_err(|_| tr!("读取 ~/.ssh/config 失败", "Failed to read ~/.ssh/config"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finished(stdout: &str) -> RunOutput {
+        RunOutput::Finished {
+            code: Some(0),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            program: "tailscale".to_string(),
+        }
+    }
+
+    #[test]
+    fn directory_matches_ip_and_magic_dns_without_the_local_node() {
+        let directory =
+            TailscaleDirectory::from_output(&finished(include_str!("../../fixtures/running.json")));
+        assert_eq!(directory.presence("100.64.0.2"), AddressPresence::Online);
+        assert_eq!(directory.presence("100.64.0.20"), AddressPresence::Online);
+        assert_eq!(
+            directory.presence("HOST-A.example-tailnet.ts.net."),
+            AddressPresence::Online
+        );
+        assert_eq!(directory.presence("100.64.0.3"), AddressPresence::Offline);
+        assert_eq!(directory.presence("198.51.100.9"), AddressPresence::Unknown);
+        assert_eq!(directory.presence("100.64.0.1"), AddressPresence::Unknown);
+    }
+
+    #[test]
+    fn unreadable_status_is_unknown() {
+        let directory = TailscaleDirectory::from_output(&RunOutput::NotInstalled);
+        assert_eq!(directory.presence("100.64.0.2"), AddressPresence::Unknown);
+    }
+}
+

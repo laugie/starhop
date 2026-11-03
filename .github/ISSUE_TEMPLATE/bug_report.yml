@@ -1,0 +1,69 @@
+name: Bug report
+description: Something does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please **remove real hostnames, usernames and IP addresses** from everything you paste (use 192.0.2.x or example.com instead). Security problems: see SECURITY.md instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection type
+      options:
+        - Direct
+        - ProxyJump (jump)
+        - Relay command (connections)
+        - Tailscale device
+        - Imported from ~/.ssh/config
+        - Not about a connection
+  - type: input
+    id: version
+    attributes:
+      label: Starhop version or commit
+      placeholder: 1.1.0 or a commit hash
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.1 (Apple silicon) / Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: ssh
+    attributes:
+      label: Output of `ssh -V`
+  - type: input
+    id: tailscale
+    attributes:
+      label: Tailscale version (if used)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error text or screenshots
+      description: Redact hosts, users and addresses.
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed real hostnames, usernames and IP addresses.
+          required: true

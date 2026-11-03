@@ -1,0 +1,62 @@
+import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+function run(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, args, { cwd: root, stdio: "inherit" });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`node exited with ${code ?? signal}`));
+    });
+  });
+}
+
+const outDir = await mkdtemp(path.join(tmpdir(), "starhop-frontend-"));
+try {
+  await run([
+    path.join(root, "node_modules", "typescript", "lib", "tsc.js"),
+    "-p",
+    "tsconfig.test.json",
+    "--outDir",
+    outDir,
+  ]);
+  await run([
+    "--test",
+    "--test-reporter",
+    "tap",
+    path.join(outDir, "write-chunks.test.js"),
+    path.join(outDir, "write-queue.test.js"),
+    path.join(outDir, "startup.test.js"),
+    path.join(outDir, "diagram.test.js"),
+    path.join(outDir, "tabs.test.js"),
+    path.join(outDir, "connection-menu.test.js"),
+    path.join(outDir, "close-confirm.test.js"),
+    path.join(outDir, "zoom.test.js"),
+    path.join(outDir, "appearance.test.js"),
+    path.join(outDir, "remote-shell.test.js"),
+    path.join(outDir, "planets.test.js"),
+    path.join(outDir, "label-layout.test.js"),
+    path.join(outDir, "quit-confirm.test.js"),
+    path.join(outDir, "tab-bar.test.js"),
+    path.join(outDir, "presence.test.js"),
+    path.join(outDir, "clipboard.test.js"),
+    path.join(outDir, "terminal-keys.test.js"),
+    path.join(outDir, "ime-input.test.js"),
+    path.join(outDir, "sftp-model.test.js"),
+    path.join(outDir, "home-devices.test.js"),
+    path.join(outDir, "ssh-paste.test.js"),
+    path.join(outDir, "welcome.test.js"),
+    path.join(outDir, "i18n.test.js"),
+  ]);
+} finally {
+  await rm(outDir, { recursive: true, force: true });
+}

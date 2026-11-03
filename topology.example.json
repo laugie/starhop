@@ -1,0 +1,73 @@
+{
+  "regions": [
+    {
+      "name": "Office",
+      "devices": [
+        {"name": "office-router", "host": "192.0.2.1", "user": "admin"},
+        {"name": "office-nas", "host": "192.0.2.5", "user": "admin", "type": "nas"},
+        {
+          "name": "laptop",
+          "host": "192.0.2.20",
+          "user": "me",
+          "mobile": true,
+          "tailscaleAddress": "192.0.2.20",
+          "type": "mac"
+        },
+        {"name": "win-desktop", "host": "192.0.2.21", "user": "me"}
+      ]
+    },
+    {
+      "name": "Cloud",
+      "devices": [
+        {
+          "name": "jump-host",
+          "host": "jump.example.com",
+          "port": 2222,
+          "user": "me",
+          "identityFile": "~/.ssh/id_example",
+          "type": "cloud"
+        },
+        {
+          "name": "app-server",
+          "host": "app.example.com",
+          "user": "me",
+          "identityFile": "~/.ssh/id_app",
+          "jump": "jump-host",
+          "type": "server",
+          "connections": [
+            {
+              "name": "via jump command",
+              "via": "jump-host",
+              "command": "tailscale nc %h %p"
+            },
+            {
+              "name": "via NAS",
+              "via": "office-nas",
+              "command": "tailscale nc %h %p",
+              "host": "192.0.2.50"
+            }
+          ]
+        },
+        {
+          "name": "inner-db",
+          "host": "192.0.2.30",
+          "port": 2200,
+          "user": "ops",
+          "jump": "app-server"
+        }
+      ]
+    },
+    {
+      "name": "Home",
+      "devices": [
+        {
+          "name": "home-box",
+          "host": "192.0.2.40",
+          "user": "me",
+          "jump": "jump-host",
+          "type": "server"
+        }
+      ]
+    }
+  ]
+}

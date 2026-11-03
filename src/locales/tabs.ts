@@ -1,0 +1,38 @@
+import { defineMessages } from "../i18n.js";
+
+export const t = defineMessages(
+  {
+    homeTitle: "Topology",
+    tabLimit: (p: { n: number }) => (p.n === 1 ? "Up to 1 tab" : `Up to ${p.n} tabs`),
+    connecting: "Connecting",
+    connected: "Connected",
+    ended: "Disconnected",
+    failed: "Connection failed",
+    exitUnknown: "Exit code unknown",
+    exitCode: "Exit code {code}",
+    tabList: "Tabs",
+    newTab: "New",
+    newTabTitle: "New (back to the topology home)",
+    reconnect: "Reconnect",
+    closeTab: "Close tab",
+    caption: "{title}, {status}",
+    captionDetail: "{title}, {status} ({detail})",
+  },
+  {
+    homeTitle: "拓扑",
+    tabLimit: (p: { n: number }) => `最多 ${p.n} 个标签`,
+    connecting: "连接中",
+    connected: "已连接",
+    ended: "已断开",
+    failed: "连接失败",
+    exitUnknown: "退出码未知",
+    exitCode: "退出码 {code}",
+    tabList: "标签",
+    newTab: "新建",
+    newTabTitle: "新建（回到拓扑首页）",
+    reconnect: "重新连接",
+    closeTab: "关闭标签",
+    caption: "{title}，{status}",
+    captionDetail: "{title}，{status}（{detail}）",
+  },
+);
