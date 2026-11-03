@@ -1,9 +1,10 @@
 # Roadmap
 
-Starhop is a small, source-only project: there are no official installers. Build it yourself ([README](README.md#build-from-source)). Community packages (a Homebrew tap, winget, Scoop) are welcome but not maintained here.
+Starhop is a small project. Each release has unsigned installers for Apple Silicon Macs and 64-bit Windows, built by GitHub Actions ([README](README.md#install)); there is no Apple developer account, so the macOS app is not notarised. Community packages (a Homebrew tap, winget, Scoop) are welcome but not maintained here.
 
 ## Ideas, roughly in order
 
+- **Intel Mac installer** (a universal macOS build).
 - **Linux support.** Tauri runs there; the PTY, keychain and clipboard parts need checking, plus CI.
 - **Home screen options:** a switch to hide Tailscale devices, and grouping or search for long lists.
 - **`topology.json` without `user` or `port`,** so hand-written devices can lean on `~/.ssh/config` like imported aliases do.
