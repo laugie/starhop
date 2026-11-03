@@ -12,9 +12,25 @@ Starhop 是一个轻量 SSH 客户端，支持 macOS 和 Windows。基于 Tauri 
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)
 - 给 AI 编程助手看的说明（项目结构、配置字段、附加功能）：[AGENTS.md](AGENTS.md)
 
+## 下载安装
+
+到 [Releases 页面](https://github.com/laugie/starhop/releases/latest) 下载：
+
+- macOS 11 及以上，Apple 芯片（M1 及以后）：`Starhop_<版本>_aarch64.dmg`
+- Windows 10/11，64 位：`Starhop_<版本>_x64-setup.exe`
+
+Intel 芯片的 Mac 暂时没有安装包，请按下面的步骤从源码构建。
+
+安装包由 GitHub Actions 构建，**没有代码签名**，第一次打开时系统会警告：
+
+- **macOS** 提示「无法打开」或「已损坏」：把 Starhop 拖进「应用程序」，然后右键点它选「打开」。还不行的话，在终端运行 `xattr -dr com.apple.quarantine /Applications/Starhop.app`。
+- **Windows** SmartScreen 提示「已保护你的电脑」：点「更多信息」，再点「仍要运行」。
+
+应用要用到系统的 `ssh`：macOS 自带；Windows 需要在「设置 > 系统 > 可选功能」里打开 OpenSSH 客户端。
+
 ## 从源码构建
 
-本项目只提供源码，不提供预编译的安装包，需要自己构建。英文 README 的「Build from source」一节有同样的说明。
+也可以自己构建。英文 README 的「Build from source」一节有同样的说明。
 
 需要：
 

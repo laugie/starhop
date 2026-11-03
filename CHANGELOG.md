@@ -6,7 +6,7 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [1.1.0] - 2026-11-02
 
-First public release, as source code. There are no prebuilt installers; see the README to build it.
+First public release. Unsigned installers for Apple Silicon Macs and 64-bit Windows are on the Releases page; see the README to install or build it.
 
 ### Added
 

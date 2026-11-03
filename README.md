@@ -20,7 +20,21 @@ A lightweight SSH client for macOS and Windows that shows your servers as a map.
 
 ## Install
 
-There are no prebuilt installers. Build Starhop from source; it takes a few minutes.
+Download the installer from the [Releases page](https://github.com/laugie/starhop/releases/latest):
+
+| System | File |
+| --- | --- |
+| macOS 11 or later, Apple Silicon (M1 and later) | `Starhop_<version>_aarch64.dmg` |
+| Windows 10/11, 64-bit | `Starhop_<version>_x64-setup.exe` |
+
+Intel Macs: there is no installer yet, so [build from source](#build-from-source).
+
+The installers are built by GitHub Actions and are **not code-signed**, so the system warns the first time you open them:
+
+- **macOS** says the app "cannot be opened" or "is damaged". Drag Starhop to Applications, then right-click it and choose **Open**. If that does not help, run `xattr -dr com.apple.quarantine /Applications/Starhop.app` in Terminal.
+- **Windows** SmartScreen says it protected your PC. Choose **More info > Run anyway**.
+
+The app also needs `ssh`: built into macOS; on Windows, turn on OpenSSH Client (Settings > System > Optional features).
 
 ### Build from source
 
