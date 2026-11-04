@@ -9,17 +9,21 @@ export interface SshInvokeTarget {
   host: string;
   user: string | null;
   port: number | null;
+  /** Manual server whose imported key the back end should use. */
+  manualId: string | null;
 }
 
 /**
  * Tailscale 行不传用户名。手动行和合并行仅在填写了用户名时传递。
  * 端口沿用列表里的值；没有端口时不传。
+ * 导入过密钥的手动行传服务器 id，由后端查出密钥；页面不接触密钥路径。
  */
 export function sshTargetOf(host: HostEntry): SshInvokeTarget {
   return {
     host: host.connectTarget,
     user: host.source === "tailscale" ? null : host.user,
     port: host.port,
+    manualId: host.hasKey ? host.id : null,
   };
 }
 
@@ -33,6 +37,7 @@ export function openSession(
     host: target.host,
     user: target.user,
     port: target.port,
+    manualId: target.manualId,
     onEvent: onEventChannel,
   });
 }

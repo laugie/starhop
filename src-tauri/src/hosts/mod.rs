@@ -1,4 +1,5 @@
 mod exec;
+pub mod key;
 pub(crate) use exec::summarize_cli_text;
 mod list;
 mod parse;
@@ -189,6 +190,11 @@ impl HostState {
         self.with_store(|store| store.set_language(language))?
     }
 
+    /// Key path for the manual server `id`; see [`JsonHostStore::identity_path`].
+    pub fn identity_path(&self, id: &str) -> Result<Option<std::path::PathBuf>, String> {
+        self.with_store(|store| store.identity_path(id))?
+    }
+
     fn with_store<T>(&self, f: impl FnOnce(&mut JsonHostStore) -> T) -> Result<T, String> {
         let mut guard = self
             .store
@@ -226,6 +232,9 @@ pub async fn list_hosts(
 
 /// Validate, remember, and immediately save a manual server.
 ///
+/// `identity_key` is the text of a private key file the user picked. It is
+/// checked and copied to `<config dir>/keys/`; the page never sends a path.
+///
 /// 碰磁盘或外部进程的 Tauri 命令一律 async，避免阻塞主线程。
 /// 写盘放在 `spawn_blocking` 里；锁只在该闭包内持有，不跨 `.await`。
 #[tauri::command]
@@ -235,13 +244,17 @@ pub async fn add_manual_host(
     host: String,
     user: Option<String>,
     port: Option<u32>,
+    identity_key: Option<String>,
 ) -> Result<ManualHost, String> {
     {
         let auth = app.state::<crate::auth::AuthState>();
         crate::auth::require_access(&auth, auth.lock_enabled())
     }
         .map_err(|err| err.to_string())?;
-    let validated = validate_manual_input(&name, &host, user.as_deref(), port)?;
+    let mut validated = validate_manual_input(&name, &host, user.as_deref(), port)?;
+    validated.key = identity_key
+        .map(|text| key::validate_key_text(&text))
+        .transpose()?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<HostState>();
         state.with_store(|store| store.add(validated))?

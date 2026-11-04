@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use pty::LiveSession;
 use tauri::Manager;
 
-pub use args::{build_ssh_args, SshOptions, SshTarget};
+pub use args::{build_ssh_args, build_ssh_args_with_key, SshOptions, SshTarget};
 pub use binary::{resolve_ssh_binary, resolve_ssh_binary_with, ssh_not_found, OsKind};
 pub use size::{normalize_pty_size, MAX_PTY_COLS, MAX_PTY_ROWS};
 
@@ -306,12 +306,15 @@ impl Drop for Reservation {
 /// `device_name` selects a row from the local topology file. Host, user, port,
 /// key path, and jump are taken from that file and checked again here. A
 /// request that sets `device_name` ignores `host` / `user` / `port`.
+/// `manual_id` names a manual server whose imported key should be used.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn open_session(
     app: tauri::AppHandle,
     host: Option<String>,
     user: Option<String>,
     port: Option<u16>,
+    manual_id: Option<String>,
     device_name: Option<String>,
     connection_name: Option<String>,
     on_event: tauri::ipc::Channel<SessionEvent>,
@@ -321,7 +324,8 @@ pub async fn open_session(
         crate::auth::require_access(&auth, auth.lock_enabled())
     }
     .map_err(|err| err.to_string())?;
-    let mut planned = plan_session(&app, host, user, port, device_name, connection_name).await?;
+    let mut planned =
+        plan_session(&app, host, user, port, manual_id, device_name, connection_name).await?;
     let args = std::mem::take(&mut planned.args);
     let mut temp_file = planned.temp_file.take();
     let relay_ends = planned.relay.take();
@@ -412,12 +416,18 @@ pub async fn open_session(
 }
 
 /// ssh arguments for a topology device (by name) or a direct host. A request
-/// that sets `device_name` ignores `host` / `user` / `port`.
+/// that sets `device_name` ignores `host` / `user` / `port` / `manual_id`.
+///
+/// For a direct host, `manual_id` names the manual server it came from. Its
+/// imported key, if any, is looked up in the store by that id and passed with
+/// `-i`; the page never sends a key path. An unknown id is an error rather
+/// than a silent connect without the key.
 pub(crate) async fn plan_session(
     app: &tauri::AppHandle,
     host: Option<String>,
     user: Option<String>,
     port: Option<u16>,
+    manual_id: Option<String>,
     device_name: Option<String>,
     connection_name: Option<String>,
 ) -> Result<crate::topology::SessionPlan, String> {
@@ -437,8 +447,21 @@ pub(crate) async fn plan_session(
         .map_err(|_| tr!("读取拓扑配置失败", "Failed to read the topology config"))?;
     }
     let host = host.ok_or_else(|| tr!("主机不能为空", "Host is required"))?;
+    let identity = match manual_id.filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let app_for_key = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                app_for_key
+                    .state::<crate::hosts::HostState>()
+                    .identity_path(&id)
+            })
+            .await
+            .map_err(|_| tr!("读取密钥文件失败", "Failed to read the key file"))??
+        }
+        None => None,
+    };
     Ok(crate::topology::SessionPlan {
-        args: build_ssh_args(&SshTarget { host, user, port })?,
+        args: build_ssh_args_with_key(&SshTarget { host, user, port }, identity.as_deref())?,
         temp_file: None,
         relay: None,
     })

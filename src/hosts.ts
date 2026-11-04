@@ -16,6 +16,8 @@ export interface HostEntry {
   port: number | null;
   source: HostSource;
   connectTarget: string;
+  /** A private key was imported for this manual server. */
+  hasKey: boolean;
 }
 
 export interface ListHostsResponse {
@@ -31,6 +33,8 @@ export interface NewManualHost {
   host: string;
   user: string | null;
   port: number | null;
+  /** Text of a private key file, kept by the back end. Never a path. */
+  identityKey?: string | null;
 }
 
 export function listHosts(): Promise<ListHostsResponse> {
@@ -43,6 +47,7 @@ export function addManualHost(input: NewManualHost): Promise<void> {
     host: input.host,
     user: input.user,
     port: input.port,
+    identityKey: input.identityKey ?? null,
   });
 }
 

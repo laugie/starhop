@@ -604,6 +604,27 @@ body {
   justify-self: start;
 }
 
+/* Spans the whole form row so a long file name has room. */
+.key-field {
+  grid-column: 1 / -1;
+}
+
+.key-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.key-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .form-error {
   min-height: 1.2em;
   margin: 8px 0 0;

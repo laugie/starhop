@@ -7,7 +7,7 @@ export type ShellMode = "auto" | "apply" | "restore";
 
 export type ShellTarget =
   | { kind: "device"; deviceName: string; connectionName?: string }
-  | { kind: "host"; host: string; user: string | null; port: number | null };
+  | { kind: "host"; host: string; user: string | null; port: number | null; manualId?: string | null };
 
 export interface ShellReport {
   outcome: "applied" | "unchanged" | "skipped" | "unsupported" | "restored" | "nothing" | "failed";

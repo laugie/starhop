@@ -232,11 +232,13 @@ pub(crate) fn hide_console(command: &mut Command) {
 /// Run the script for a topology device or a direct host, on the same route
 /// as its tab. `mode` is `auto`, `apply` or `restore`.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn remote_shell_run(
     app: tauri::AppHandle,
     host: Option<String>,
     user: Option<String>,
     port: Option<u16>,
+    manual_id: Option<String>,
     device_name: Option<String>,
     connection_name: Option<String>,
     mode: String,
@@ -247,8 +249,16 @@ pub async fn remote_shell_run(
     }
     .map_err(|err| err.to_string())?;
     let mode = Mode::parse(&mode)?;
-    let planned =
-        crate::session::plan_session(&app, host, user, port, device_name, connection_name).await?;
+    let planned = crate::session::plan_session(
+        &app,
+        host,
+        user,
+        port,
+        manual_id,
+        device_name,
+        connection_name,
+    )
+    .await?;
     tauri::async_runtime::spawn_blocking(move || {
         let program = crate::session::resolve_ssh_binary()?;
         let args = remote_args(planned.args.clone(), mode)?;

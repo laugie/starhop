@@ -16,6 +16,7 @@ function peer(over: Partial<HostEntry> & { id: string; name: string }): HostEntr
     port: null,
     source: "tailscale",
     connectTarget: `${over.name}.example.ts.net`,
+    hasKey: false,
     ...over,
   };
 }
@@ -55,6 +56,7 @@ test("Tailscale peers and manual servers become two extra regions after the topo
         port: 2200,
         source: "manual",
         connectTarget: "198.51.100.7",
+        hasKey: false,
       },
     ]),
   );

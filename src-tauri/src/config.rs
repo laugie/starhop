@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::hosts::{HostStore, ManualHost, NewManualHost};
+use crate::hosts::{key, HostStore, ManualHost, NewManualHost};
 
 pub const CONFIG_VERSION: u32 = 1;
 pub const CONFIG_DIR_NAME: &str = "starhop";
@@ -845,34 +845,79 @@ impl JsonHostStore {
         self.config.manual_hosts.clone()
     }
 
+    /// Save a manual server. An imported key is written to `keys/<id>.pem`
+    /// first and deleted again if the config cannot be saved.
     pub fn add(&mut self, host: NewManualHost) -> Result<ManualHost, String> {
         self.ensure_writable()?;
+        let id = next_manual_id(&self.config.manual_hosts)?;
+        let identity_file = match &host.key {
+            Some(text) => {
+                let name = key::key_file_name(&id);
+                key::write_key(&self.dir, &name, text)?;
+                Some(name)
+            }
+            None => None,
+        };
         let stored = ManualHost {
-            id: next_manual_id(&self.config.manual_hosts)?,
+            id,
             name: host.name,
             host: host.host,
             user: host.user,
             port: host.port,
+            identity_file,
         };
         let mut next = self.config.clone();
         next.manual_hosts.push(stored.clone());
         next.version = CONFIG_VERSION;
-        self.persist(&next)?;
+        if let Err(err) = self.persist(&next) {
+            if let Some(name) = &stored.identity_file {
+                key::remove_key(&self.dir, name);
+            }
+            return Err(err);
+        }
         self.config = next;
         Ok(stored)
     }
 
+    /// Drop a manual server and, once the config is saved, its key file.
     pub fn remove(&mut self, id: &str) -> Result<(), String> {
         self.ensure_writable()?;
-        if !self.config.manual_hosts.iter().any(|host| host.id == id) {
+        let Some(removed) = self.config.manual_hosts.iter().find(|host| host.id == id).cloned()
+        else {
             return Err(crate::tr!("未找到该服务器", "Server not found"));
-        }
+        };
         let mut next = self.config.clone();
         next.manual_hosts.retain(|host| host.id != id);
         next.version = CONFIG_VERSION;
         self.persist(&next)?;
         self.config = next;
+        if let Some(name) = &removed.identity_file {
+            key::remove_key(&self.dir, name);
+        }
         Ok(())
+    }
+
+    /// Path of the key imported for manual server `id`, or `None` when it has
+    /// none. The stored name is checked again, so `-i` always points into
+    /// `keys/` even if `config.json` was edited by hand.
+    pub fn identity_path(&self, id: &str) -> Result<Option<PathBuf>, String> {
+        let host = self
+            .config
+            .manual_hosts
+            .iter()
+            .find(|host| host.id == id)
+            .ok_or_else(|| crate::tr!("未找到该服务器", "Server not found"))?;
+        let Some(name) = &host.identity_file else {
+            return Ok(None);
+        };
+        let path = key::key_path(&self.dir, name)?;
+        if !path.is_file() {
+            return Err(crate::tr!(
+                "找不到该服务器的密钥文件，请移除后重新添加",
+                "The key file for this server is missing. Remove the server and add it again"
+            ));
+        }
+        Ok(Some(path))
     }
 
     fn ensure_writable(&self) -> Result<(), String> {
