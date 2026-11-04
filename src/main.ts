@@ -14,6 +14,7 @@ import {
 import { loadTopology, probePresence, type TopologyView } from "./topology.ts";
 import { mergeDiscovered, type HomeDevices } from "./home-devices.ts";
 import { parseSshInput } from "./ssh-paste.ts";
+import { readKeyFile } from "./key-import.ts";
 import { tailscaleHint } from "./welcome.ts";
 import { PRESENCE_INTERVAL_MS, applyPresence, connectedDevices, type DevicePresence } from "./presence.ts";
 import { renderTopology, syncDeviceOpenState } from "./topology-view.ts";
@@ -96,6 +97,28 @@ portInput.placeholder = t("portDefault");
 portInput.title = t("portTitle");
 portInput.min = "1";
 portInput.max = "65535";
+// Optional private key. The text is read when the form is submitted.
+const keyField = el("div", "field key-field");
+keyField.title = t("keyTitle");
+const keyCaption = el("span", "field-label");
+keyCaption.textContent = t("keyLabel");
+const keyInput = document.createElement("input");
+keyInput.type = "file";
+keyInput.hidden = true;
+const keyRow = el("div", "key-row");
+const keyChoose = document.createElement("button");
+keyChoose.type = "button";
+keyChoose.className = "button";
+keyChoose.textContent = t("keyChoose");
+const keyName = el("span", "key-name");
+const keyClear = document.createElement("button");
+keyClear.type = "button";
+keyClear.className = "button ghost";
+keyClear.textContent = t("keyClear");
+keyRow.append(keyChoose, keyName, keyClear);
+keyField.append(keyCaption, keyInput, keyRow);
+form.append(keyField);
+syncKeyField();
 const submit = document.createElement("button");
 submit.type = "submit";
 submit.className = "button primary";
@@ -400,6 +423,23 @@ refreshButton.addEventListener("click", () => {
 form.addEventListener("submit", (event) => {
   event.preventDefault();
   void onAdd();
+});
+
+function syncKeyField(): void {
+  const file = keyInput.files?.[0];
+  keyName.textContent = file ? file.name : t("keyNone");
+  keyClear.hidden = !file;
+}
+keyChoose.addEventListener("click", () => {
+  keyInput.click();
+});
+keyInput.addEventListener("change", () => {
+  formError.textContent = "";
+  syncKeyField();
+});
+keyClear.addEventListener("click", () => {
+  keyInput.value = "";
+  syncKeyField();
 });
 
 function fillFromPaste(): void {
@@ -962,13 +1002,16 @@ async function onAdd(): Promise<void> {
   }
   submit.disabled = true;
   try {
+    const keyFile = keyInput.files?.[0];
     await addManualHost({
       name,
       host,
       user: user === "" ? null : user,
       port,
+      identityKey: keyFile ? await readKeyFile(keyFile) : null,
     });
     form.reset();
+    syncKeyField();
     await refreshHosts();
   } catch (err) {
     formError.textContent = errorText(err);
@@ -1071,6 +1114,11 @@ function renderHost(host: HostEntry): HTMLLIElement {
   const tag = el("span", "tag");
   tag.textContent = sourceLabel(host.source);
   meta.append(address, tag);
+  if (host.hasKey) {
+    const keyTag = el("span", "tag");
+    keyTag.textContent = t("keyTag");
+    meta.append(keyTag);
+  }
 
   const connect = document.createElement("button");
   connect.type = "button";

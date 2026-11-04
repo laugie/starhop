@@ -10,6 +10,10 @@ pub struct ManualHost {
     /// None lets ssh choose: 22, or the `Port` in `~/.ssh/config` for an alias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    /// File name of an imported private key under `<config dir>/keys/`.
+    /// Never a path; see [`crate::hosts::key::key_path`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
 }
 
 /// Validated fields before the store assigns an id.
@@ -19,6 +23,9 @@ pub struct NewManualHost {
     pub host: String,
     pub user: Option<String>,
     pub port: Option<u16>,
+    /// Text of an imported private key, already checked by
+    /// [`crate::hosts::key::validate_key_text`].
+    pub key: Option<String>,
 }
 
 /// Storage boundary for manual servers.
@@ -48,8 +55,10 @@ impl HostStore for MemoryHostStore {
 
     fn add(&mut self, host: NewManualHost) -> Result<ManualHost, String> {
         self.next_id += 1;
+        let id = format!("manual-{}", self.next_id);
         let stored = ManualHost {
-            id: format!("manual-{}", self.next_id),
+            identity_file: host.key.as_ref().map(|_| super::key::key_file_name(&id)),
+            id,
             name: host.name,
             host: host.host,
             user: host.user,
@@ -132,6 +141,7 @@ pub fn validate_manual_input(
         host: host.to_string(),
         user,
         port,
+        key: None,
     })
 }
 

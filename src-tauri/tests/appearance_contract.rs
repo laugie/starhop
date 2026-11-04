@@ -44,6 +44,7 @@ fn with_host(dir: &Path) {
             host: "192.0.2.7".to_string(),
             user: Some("me".to_string()),
             port: Some(22),
+            key: None,
         })
         .unwrap();
 }

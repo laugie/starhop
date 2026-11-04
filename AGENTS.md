@@ -82,7 +82,9 @@ Device fields: `name`, `host`, `user` (required); `port` (default 22), `identity
 
 ### Devices without a config file
 
-The home screen also shows, as extra regions: Tailscale peers (when the Tailscale CLI is installed and logged in) and manual servers (added on the "手动服务器" page, saved in `config.json` under `manualHosts` with `name`, `host`, optional `user`, `port`). A new user can connect without writing `topology.json`. A manual server without `port` lets ssh choose it (22, or `Port` from `~/.ssh/config`).
+The home screen also shows, as extra regions: Tailscale peers (when the Tailscale CLI is installed and logged in) and manual servers (added on the "手动服务器" page, saved in `config.json` under `manualHosts` with `name`, `host`, optional `user`, `port`, `identityFile`). A new user can connect without writing `topology.json`. A manual server without `port` lets ssh choose it (22, or `Port` from `~/.ssh/config`).
+
+The add form can import a private key file (for example a cloud provider's `.pem`). The page sends the file's text, never a path. The back end checks it (`src-tauri/src/hosts/key.rs`) and writes a copy to `keys/<server id>.pem` in the config directory, readable only by the user. `identityFile` holds only that file name. Connections look the key up by server id and pass `-i <path> -o IdentitiesOnly=yes`. Removing the server deletes the copy. Passphrase-protected keys prompt in the terminal; SFTP and remote shell beautify use `BatchMode=yes`, so they need an unencrypted key or ssh-agent.
 
 On an empty home screen a welcome card offers "添加服务器" (the add form also accepts a pasted `ssh` command, parsed by `src/ssh-paste.ts`) and "从 ~/.ssh/config 导入" (the back end lists `Host` aliases from `~/.ssh/config` and its `Include`s, see `src-tauri/src/hosts/ssh_config.rs`; each chosen alias is added as a manual server with only `name` and `host`, so ssh applies the rest of the config).
 

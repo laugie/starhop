@@ -51,6 +51,7 @@ fn sample(name: &str, host: &str, port: u16) -> NewManualHost {
         host: host.to_string(),
         user: Some("user".to_string()),
         port: Some(port),
+        key: None,
     }
 }
 
@@ -283,6 +284,7 @@ fn failed_atomic_write_keeps_the_previous_file() {
             host: "host-a.example".to_string(),
             user: Some("user".to_string()),
             port: Some(2222),
+            identity_file: None,
         });
     save_config(&dir, &config).unwrap();
     let original = fs::read(dir.join("config.json")).unwrap();
@@ -396,6 +398,7 @@ fn manual_host_without_port_round_trips_without_a_port_field() {
             host: "work".to_string(),
             user: None,
             port: None,
+            key: None,
         })
         .unwrap();
     assert_eq!(added.port, None);
@@ -454,4 +457,87 @@ fn notices_and_errors_follow_the_language_when_read() {
         assert_eq!(store.remove("manual-404").unwrap_err(), "Server not found");
     });
     assert_eq!(store.remove("manual-404").unwrap_err(), "未找到该服务器");
+}
+
+/// Key-shaped text built at run time so no key block sits in the repository.
+fn fake_key() -> String {
+    let dashes = "-".repeat(5);
+    format!("{dashes}BEGIN OPENSSH PRIVATE KEY{dashes}\r\nAAAAexampleonlyAAAA\r\n{dashes}END OPENSSH PRIVATE KEY{dashes}")
+}
+
+fn with_key(name: &str, host: &str) -> NewManualHost {
+    NewManualHost {
+        key: Some(starhop_lib::hosts::key::validate_key_text(&fake_key()).unwrap()),
+        ..sample(name, host, 22)
+    }
+}
+
+#[test]
+fn imported_key_is_copied_and_only_its_file_name_is_saved() {
+    let dir = TempDir::new("key-import");
+    let mut store = JsonHostStore::open(&dir);
+    let plain = store.add(sample("plain", "host-a.example", 22)).unwrap();
+    assert_eq!(plain.identity_file, None);
+    assert_eq!(store.identity_path(&plain.id).unwrap(), None);
+    assert!(!dir.join("keys").exists(), "no key, no keys folder");
+
+    let added = store.add(with_key("aws", "host-b.example")).unwrap();
+    assert_eq!(added.identity_file.as_deref(), Some("manual-2.pem"));
+    let key_file = dir.join("keys").join("manual-2.pem");
+    let saved = fs::read_to_string(&key_file).unwrap();
+    assert!(saved.ends_with("END OPENSSH PRIVATE KEY-----\n"));
+    assert!(!saved.contains('\r'), "line endings are normalized");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&key_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "ssh refuses keys other users can read");
+    }
+
+    let text = fs::read_to_string(dir.join("config.json")).unwrap();
+    assert!(!text.contains("PRIVATE KEY"), "the key text stays out of config.json");
+    assert!(!text.contains("AAAAexampleonly"));
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["manualHosts"][1]["identityFile"], "manual-2.pem");
+    assert!(value["manualHosts"][0].get("identityFile").is_none());
+
+    drop(store);
+    let mut store = JsonHostStore::open(&dir);
+    assert_eq!(store.identity_path("manual-2").unwrap(), Some(key_file.clone()));
+    store.remove("manual-2").unwrap();
+    assert!(!key_file.exists(), "removing the server deletes its key");
+    assert_eq!(store.identity_path("manual-2").unwrap_err(), "未找到该服务器");
+}
+
+#[test]
+fn key_file_is_removed_when_the_config_cannot_be_saved() {
+    let dir = TempDir::new("key-unwritable");
+    let mut store = JsonHostStore::open(&dir);
+    store.set_save_hook(|_, _| Err("无法保存配置".to_string()));
+    assert_eq!(store.add(with_key("aws", "host-b.example")).unwrap_err(), "无法保存配置");
+    assert!(!dir.join("keys").join("manual-1.pem").exists());
+    assert!(store.list().is_empty());
+}
+
+#[test]
+fn edited_or_missing_key_file_names_are_refused() {
+    let dir = TempDir::new("key-edited");
+    fs::write(
+        dir.join("config.json"),
+        r#"{"version":1,"manualHosts":[
+            {"id":"manual-1","name":"a","host":"host-a.example","identityFile":"../config.json"},
+            {"id":"manual-2","name":"b","host":"host-b.example","identityFile":"manual-2.pem"}
+        ],"settings":{}}"#,
+    )
+    .unwrap();
+    let store = JsonHostStore::open(&dir);
+    assert_eq!(store.notice(), None, "identityFile loads without a notice");
+    assert_eq!(store.list()[1].identity_file.as_deref(), Some("manual-2.pem"));
+    assert_eq!(store.identity_path("manual-1").unwrap_err(), "配置里的密钥文件名无效");
+    with_lang(Lang::En, || {
+        assert_eq!(
+            store.identity_path("manual-2").unwrap_err(),
+            "The key file for this server is missing. Remove the server and add it again"
+        );
+    });
 }

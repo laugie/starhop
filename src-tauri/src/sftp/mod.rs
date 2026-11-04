@@ -360,12 +360,21 @@ pub async fn sftp_open(
     host: Option<String>,
     user: Option<String>,
     port: Option<u16>,
+    manual_id: Option<String>,
     device_name: Option<String>,
     connection_name: Option<String>,
 ) -> Result<SftpOpened, String> {
     check_access(&app)?;
-    let planned =
-        crate::session::plan_session(&app, host, user, port, device_name, connection_name).await?;
+    let planned = crate::session::plan_session(
+        &app,
+        host,
+        user,
+        port,
+        manual_id,
+        device_name,
+        connection_name,
+    )
+    .await?;
     let epoch = app.state::<SftpState>().room()?;
     let app_for_task = app.clone();
     tauri::async_runtime::spawn_blocking(move || {

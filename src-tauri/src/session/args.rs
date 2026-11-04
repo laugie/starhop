@@ -43,6 +43,37 @@ pub fn build_ssh_args(target: &SshTarget) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+/// [`build_ssh_args`] plus the private key imported for a manual server.
+///
+/// The host, user and port go through the same checks as before, so IPv6 and
+/// alias hosts keep working. The key path is made by the back end (under the
+/// config folder, see `hosts::key`), never taken from the page; it may contain
+/// spaces (`Application Support`) because it is its own argument.
+/// `IdentitiesOnly=yes` makes ssh offer this key and not every agent key
+/// first, which servers with a low `MaxAuthTries` would otherwise refuse.
+pub fn build_ssh_args_with_key(
+    target: &SshTarget,
+    identity: Option<&std::path::Path>,
+) -> Result<Vec<String>, String> {
+    let mut args = build_ssh_args(target)?;
+    let Some(path) = identity else {
+        return Ok(args);
+    };
+    let path = path
+        .to_str()
+        .filter(|text| std::path::Path::new(text).is_absolute() && !text.starts_with('-'))
+        .filter(|text| !text.chars().any(char::is_control))
+        .ok_or_else(|| tr!("密钥路径无效", "Invalid key path"))?;
+    let dash = args
+        .iter()
+        .position(|arg| arg == "--")
+        .ok_or_else(|| tr!("ssh 参数缺少 --", "The ssh arguments are missing --"))?;
+    for (offset, arg) in ["-i", path, "-o", "IdentitiesOnly=yes"].into_iter().enumerate() {
+        args.insert(dash + offset, arg.to_string());
+    }
+    Ok(args)
+}
+
 /// One ssh invocation that may name a key path and a jump spec.
 ///
 /// `build_ssh_args` is unchanged. Topology sessions use this constructor so
@@ -192,6 +223,41 @@ mod tests {
             user: user.map(str::to_string),
             port,
         }
+    }
+
+    #[test]
+    fn imported_key_goes_before_the_host_with_identities_only() {
+        let dir = std::env::temp_dir().join("Application Support").join("starhop");
+        let key = dir.join("keys").join("manual-1.pem");
+        let args =
+            build_ssh_args_with_key(&target("2001:db8::5", Some("me"), Some(2222)), Some(&key))
+                .unwrap();
+        let key_text = key.to_str().unwrap().to_string();
+        assert_eq!(
+            args,
+            vec![
+                "-t".to_string(),
+                "-l".to_string(),
+                "me".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "-i".to_string(),
+                key_text,
+                "-o".to_string(),
+                "IdentitiesOnly=yes".to_string(),
+                "--".to_string(),
+                "2001:db8::5".to_string(),
+            ]
+        );
+        let none = build_ssh_args_with_key(&target("host-a", None, None), None).unwrap();
+        assert_eq!(none, build_ssh_args(&target("host-a", None, None)).unwrap());
+        assert!(build_ssh_args_with_key(
+            &target("host-a", None, None),
+            Some(std::path::Path::new("relative.pem"))
+        )
+        .is_err());
+        let smuggled = target("-oProxyCommand=x", None, None);
+        assert!(build_ssh_args_with_key(&smuggled, Some(&key)).is_err());
     }
 
     #[test]

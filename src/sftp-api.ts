@@ -32,7 +32,7 @@ export function sftpOpen(target: ShellTarget): Promise<{ id: string; home: strin
   const fields =
     target.kind === "device"
       ? { deviceName: target.deviceName, connectionName: target.connectionName ?? null }
-      : { host: target.host, user: target.user, port: target.port };
+      : { host: target.host, user: target.user, port: target.port, manualId: target.manualId ?? null };
   return invoke("sftp_open", fields);
 }
 

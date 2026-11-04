@@ -47,6 +47,9 @@ pub struct HostEntry {
     /// `tailscale`, `manual`, or `tailscale+manual`.
     pub source: String,
     pub connect_target: String,
+    /// A private key was imported for this manual server. The page then sends
+    /// the server id so the back end can add `-i`; it never sees the path.
+    pub has_key: bool,
 }
 
 /// Payload returned by `list_hosts`. Manual servers are always present.
@@ -336,6 +339,7 @@ fn tailscale_entry(peer: &TailscalePeer) -> HostEntry {
         port: None,
         source: "tailscale".to_string(),
         connect_target: peer.connect_target.clone(),
+        has_key: false,
     }
 }
 
@@ -356,6 +360,7 @@ fn manual_entry(manual: &ManualHost) -> HostEntry {
         port: manual.port,
         source: "manual".to_string(),
         connect_target: manual.host.clone(),
+        has_key: manual.identity_file.is_some(),
     }
 }
 
@@ -371,6 +376,7 @@ fn merged_entry(peer: &TailscalePeer, manual: &ManualHost) -> HostEntry {
         port: manual.port,
         source: "tailscale+manual".to_string(),
         connect_target: peer.connect_target.clone(),
+        has_key: manual.identity_file.is_some(),
     }
 }
 
@@ -397,6 +403,7 @@ mod tests {
             host: host.to_string(),
             user: Some("user".to_string()),
             port: Some(port),
+            identity_file: None,
         }
     }
 

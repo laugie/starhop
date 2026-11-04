@@ -42,6 +42,7 @@
     "src/sftp-model.test.ts",
     "src/home-devices.test.ts",
     "src/ssh-paste.test.ts",
+    "src/key-import.test.ts",
     "src/welcome.test.ts",
     "src/i18n.test.ts"
   ]

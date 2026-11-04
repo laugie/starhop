@@ -54,6 +54,7 @@ try {
     path.join(outDir, "sftp-model.test.js"),
     path.join(outDir, "home-devices.test.js"),
     path.join(outDir, "ssh-paste.test.js"),
+    path.join(outDir, "key-import.test.js"),
     path.join(outDir, "welcome.test.js"),
     path.join(outDir, "i18n.test.js"),
   ]);
