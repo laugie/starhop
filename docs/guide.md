@@ -56,7 +56,7 @@ When Tailscale is installed and logged in, the other devices in your tailnet app
 
 Open the "Manual servers" page from the right side of the toolbar. Click it again, or click the home tab, to go back to the map. The page also lists the Tailscale devices.
 
-A manual server has a name, a host, and an optional user and port. Saved entries go to `config.json` under `manualHosts`:
+A manual server has a name, a host, and an optional user, port and private key. Saved entries go to `config.json` under `manualHosts`:
 
 ```json
 "manualHosts": [
@@ -64,6 +64,8 @@ A manual server has a name, a host, and an optional user and port. Saved entries
   {"name": "build", "host": "build"}
 ]
 ```
+
+"Import .pem file…" takes a private key file, for example one downloaded from a cloud provider. Starhop keeps its own unencrypted copy in the `keys` folder of its config directory (on macOS, readable only by you) and removes it with the server; `config.json` stores only the copy's file name in `identityFile`. For that server, ssh offers only this key, not ssh-agent keys. A passphrase-protected key asks for the passphrase in the terminal, but file transfer and remote shell beautify cannot ask, so they need a key without a passphrase or ssh-agent. PuTTY `.ppk` files need exporting to OpenSSH format first.
 
 If you leave the port empty, ssh chooses it: 22, or the `Port` from `~/.ssh/config`.
 

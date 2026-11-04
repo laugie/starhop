@@ -4,6 +4,12 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-04
+
+### Added
+
+- Import a private key file (for example a cloud provider's `.pem`) when adding a manual server. Terminal, file transfer and remote shell beautify all use it. Starhop keeps its own unencrypted copy in the `keys` folder of its config directory (on macOS, readable only by you) and removes it with the server. For that server, ssh offers only this key, not ssh-agent keys. Passphrase-protected keys work in the terminal; file transfer and remote shell beautify need a key without a passphrase or ssh-agent. PuTTY `.ppk` files need exporting to OpenSSH format first.
+
 ## [1.1.0] - 2026-11-02
 
 First public release. Unsigned installers for Apple Silicon Macs and 64-bit Windows are on the Releases page; see the README to install or build it.
