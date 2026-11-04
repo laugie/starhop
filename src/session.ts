@@ -1,6 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { HostEntry } from "./hosts.ts";
-import { keyedServerId } from "./key-import.ts";
+import { keyedServerId } from "./key-import.js";
 
 export type SessionEvent =
   | { kind: "data"; bytes: number[] }

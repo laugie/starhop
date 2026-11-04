@@ -10,6 +10,7 @@ declare module "node:assert/strict" {
     function ok(value: unknown, message?: string): void;
     function match(value: string, pattern: RegExp, message?: string): void;
     function notEqual(actual: unknown, expected: unknown, message?: string): void;
+    function rejects(promise: Promise<unknown>, pattern: RegExp, message?: string): Promise<void>;
   }
   export default assert;
 }
