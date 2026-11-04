@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import type { HostEntry } from "./hosts.ts";
+import { keyedServerId } from "./key-import.ts";
 
 export type SessionEvent =
   | { kind: "data"; bytes: number[] }
@@ -23,7 +24,7 @@ export function sshTargetOf(host: HostEntry): SshInvokeTarget {
     host: host.connectTarget,
     user: host.source === "tailscale" ? null : host.user,
     port: host.port,
-    manualId: host.hasKey ? host.id : null,
+    manualId: keyedServerId(host),
   };
 }
 

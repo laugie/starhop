@@ -2,9 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setLocale } from "./i18n.js";
-import { KEY_MAX_BYTES, readKeyFile } from "./key-import.js";
-import { sshTargetOf } from "./session.js";
-import type { HostEntry } from "./hosts.js";
+import { KEY_MAX_BYTES, keyedServerId, readKeyFile } from "./key-import.js";
 
 function fakeFile(size: number, text: string): Pick<File, "size" | "text"> {
   return { size, text: async () => text };
@@ -31,33 +29,8 @@ test("a file over the limit is refused without reading it", async () => {
   }
 });
 
-function entry(over: Partial<HostEntry>): HostEntry {
-  return {
-    id: "manual-3",
-    name: "aws",
-    host: "203.0.113.9",
-    ip: "203.0.113.9",
-    online: null,
-    os: null,
-    user: "ec2-user",
-    port: null,
-    source: "manual",
-    connectTarget: "203.0.113.9",
-    hasKey: false,
-    ...over,
-  };
-}
-
-test("only a server with an imported key sends its id, and never a path", () => {
-  assert.deepEqual(sshTargetOf(entry({ hasKey: true })), {
-    host: "203.0.113.9",
-    user: "ec2-user",
-    port: null,
-    manualId: "manual-3",
-  });
-  assert.equal(sshTargetOf(entry({})).manualId, null);
-  assert.equal(
-    sshTargetOf(entry({ id: "ts:n1", source: "tailscale", user: null })).manualId,
-    null,
-  );
+test("only a server with an imported key sends its id", () => {
+  assert.equal(keyedServerId({ id: "manual-3", hasKey: true }), "manual-3");
+  assert.equal(keyedServerId({ id: "manual-4", hasKey: false }), null);
+  assert.equal(keyedServerId({ id: "ts:n1", hasKey: false }), null);
 });
