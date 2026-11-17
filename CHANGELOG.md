@@ -4,6 +4,8 @@ All notable changes are listed here. The format follows [Keep a Changelog](https
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-17
+
 ### Added
 
 - Drag session tabs left and right to reorder them. The home tab stays first. A moved tab keeps its title, and Cmd/Ctrl+1 to 8 follow the new order. Esc during a drag puts the tab back.
