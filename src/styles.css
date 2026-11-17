@@ -208,6 +208,20 @@ body {
   background: var(--accent);
 }
 
+/* Dragging a session tab to reorder it: the tab follows the pointer above its neighbours. */
+.tabbar-dragging,
+.tabbar-dragging .tab {
+  cursor: grabbing;
+}
+
+.tab-dragging {
+  z-index: 1;
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+  color: var(--text);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
 .tab-home {
   flex: none;
   min-width: 0;

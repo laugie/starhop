@@ -11,7 +11,7 @@ A lightweight SSH client for macOS and Windows that shows your servers as a map.
 - **No setup to start.** Tailscale devices appear on the home screen by themselves. Add other servers by pasting an `ssh` command, or import the hosts in your `~/.ssh/config`.
 - **A map of your network,** in 3D (planets and orbits) or 2D (a diagram), drawn from an optional `topology.json`: regions, device types, jump hosts (ProxyJump) and relay commands such as `tailscale nc %h %p`.
 - **Online status** for every device, worked out on your computer: from Tailscale, or by checking the SSH port. Nothing is installed on your servers.
-- **Tabs** for up to 8 sessions, with keyboard shortcuts.
+- **Tabs** for up to 8 sessions, with keyboard shortcuts; drag to reorder.
 - **File transfer (SFTP)** in the same tab: two panes, drag and drop, progress, retry.
 - **Copy and paste** that behaves: a whole selection is copied, multi-line pastes ask first, and `tmux`/`vim` copies (OSC 52) reach your clipboard.
 - **Themes and fonts:** eight colour themes, 256 colours and true colour, the bundled JetBrains Mono, and UI zoom.

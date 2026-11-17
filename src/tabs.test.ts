@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { setLocale } from "./i18n.js";
-import { TabStrip, sessionLimitMessage, shortcutAction, statusLabel } from "./tabs.js";
+import { TabStrip, dropSlot, sessionLimitMessage, shortcutAction, statusLabel } from "./tabs.js";
 
 function strip(limit = 8) {
   const opened: string[] = [], closed: string[] = [];
@@ -189,4 +189,64 @@ test("Cmd/Ctrl+W on home does nothing; jump beyond count is ignored", async () =
   s.jump("last");
   assert.equal(s.activeKey, s.tabs[1].key);
   assert.deepEqual(closed, []);
+});
+
+test("dragging moves a session tab; home stays first", async () => {
+  const { s } = strip();
+  const a = await s.openDevice("a"); const b = await s.openDevice("b"); const c = await s.openDevice("c");
+  const order = () => s.tabs.map((t) => t.deviceName ?? "home");
+  assert.equal(s.move(c, 1), true);
+  assert.deepEqual(order(), ["home", "c", "a", "b"]);
+  assert.equal(s.move(c, 0), false, "不能拖到首页前面");
+  assert.deepEqual(order(), ["home", "c", "a", "b"]);
+  assert.equal(s.move(a, 99), true, "超出范围放到最后");
+  assert.deepEqual(order(), ["home", "c", "b", "a"]);
+  assert.equal(s.move(s.tabs[0].key, 2), false, "首页不能拖");
+  assert.equal(s.move(b, 2), false, "原地不动");
+  assert.equal(s.move("missing", 1), false);
+  assert.equal(s.tabs[0].kind, "home");
+  assert.equal(s.activeKey, c, "拖动不改变当前标签");
+  s.jump(2);
+  assert.equal(s.activeKey, c, "Cmd+2 跟着新的顺序");
+});
+
+test("moving a tab notifies the page", async () => {
+  let changes = 0;
+  const s = new TabStrip({
+    openSession: async () => ({ id: "s" }),
+    closeSession: async () => {},
+    onChange: () => { changes += 1; },
+  });
+  const a = await s.openDevice("a"); await s.openDevice("b");
+  const before = changes;
+  s.move(a, 2);
+  assert.equal(changes, before + 1);
+  s.move(a, 2);
+  assert.equal(changes, before + 1, "没有变化时不通知");
+});
+
+test("a dragged tab keeps its title; numbers follow the open order", async () => {
+  const { s } = strip();
+  const first = await s.openDevice("nas"); const second = await s.openDevice("nas"); const third = await s.openDevice("nas");
+  s.move(third, 1);
+  const titles = () => s.tabs.slice(1).map((t) => t.title);
+  assert.deepEqual(titles(), ["nas (3)", "nas", "nas (2)"]);
+  s.close(first);
+  assert.deepEqual(titles(), ["nas (2)", "nas"], "关闭后仍按打开顺序重新编号");
+  assert.equal(s.tabs.find((t) => t.key === second)?.title, "nas");
+  await s.openDevice("nas");
+  assert.deepEqual(titles(), ["nas (2)", "nas", "nas (3)"]);
+});
+
+test("drop slot: count the other tabs whose centre is left of the pointer", () => {
+  const centers = [100, 300, 500, 700];
+  assert.equal(dropSlot(centers, 0, 50), 0);
+  assert.equal(dropSlot(centers, 0, 299), 0, "还没越过右邻居的中线");
+  assert.equal(dropSlot(centers, 0, 301), 1);
+  assert.equal(dropSlot(centers, 0, 900), 3);
+  assert.equal(dropSlot(centers, 3, 550), 3, "还没越过左邻居的中线");
+  assert.equal(dropSlot(centers, 3, 450), 2, "向左越过左邻居中线");
+  assert.equal(dropSlot(centers, 3, 0), 0);
+  assert.equal(dropSlot(centers, 1, 300), 1, "原地");
+  assert.equal(dropSlot([], 0, 10), 0);
 });
