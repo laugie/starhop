@@ -296,7 +296,8 @@ When ssh exits with code 255, the app adds one line at the end of the terminal s
 Clicking a device (or selecting it with Tab and pressing Enter or Space) always opens a new tab and switches to it.
 
 - The same device can have several tabs. Their titles are numbered in the order opened, and are renumbered when you close one in the middle.
-- The home screen is pinned as the first tab and has no close button.
+- Drag a session tab left or right to reorder the tabs. A moved tab keeps its title, and the Go to tab N shortcuts follow the new order. Press Esc during a drag to put the tab back.
+- The home screen is pinned as the first tab, has no close button and cannot be dragged.
 - Each tab shows its state: connecting, connected, disconnected or failed.
 - Up to 8 session tabs can be open; the home tab does not count. With 8 open, clicking a device shows a message that the limit is reached, and devices are marked `aria-disabled`.
 - Closing a connecting or connected tab asks first.

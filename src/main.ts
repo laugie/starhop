@@ -172,6 +172,9 @@ const tabBar: TabBar = mountTabBar(shell, {
   onClose: (key) => {
     void requestClose(key);
   },
+  onMove: (key, index) => {
+    strip.move(key, index);
+  },
   onNew: () => {
     focusHome();
   },

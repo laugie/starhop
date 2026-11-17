@@ -140,6 +140,8 @@ export class TabStrip {
   activeKey: string = HOME_KEY;
   private seq = 0;
   private readonly closedIds = new Set<string>();
+  /** When each session tab was opened. Duplicate titles are numbered in this order. */
+  private readonly openOrder = new Map<string, number>();
 
   constructor(private readonly deps: TabStripDeps) {
     this.tabs.push({
@@ -196,6 +198,7 @@ export class TabStrip {
       return false;
     }
     this.tabs.splice(index, 1);
+    this.openOrder.delete(key);
     this.requestCloseSession(tab.sessionId);
     this.refreshTitles();
     if (this.activeKey === key) {
@@ -210,6 +213,26 @@ export class TabStrip {
 
   closeActive(): boolean {
     return this.close(this.activeKey);
+  }
+
+  /**
+   * Moves a session tab to `index` in `tabs`. Home stays first, so the index is
+   * clamped to the session tabs. Titles keep their numbers: they follow the tab.
+   */
+  move(key: string, index: number): boolean {
+    const from = this.tabs.findIndex((tab) => tab.key === key);
+    const tab = this.tabs[from];
+    if (!tab || tab.kind !== "session") {
+      return false;
+    }
+    const to = Math.min(Math.max(Math.trunc(index), 1), this.tabs.length - 1);
+    if (to === from) {
+      return false;
+    }
+    this.tabs.splice(from, 1);
+    this.tabs.splice(to, 0, tab);
+    this.emit();
+    return true;
   }
 
   jump(index: number | "last"): void {
@@ -271,7 +294,8 @@ export class TabStrip {
     if (!this.canOpen()) {
       throw new Error(sessionLimitMessage(this.maxSessions()));
     }
-    const key = `t${++this.seq}`;
+    const order = ++this.seq;
+    const key = `t${order}`;
     const tab: TabModel = {
       key,
       kind: "session",
@@ -283,6 +307,7 @@ export class TabStrip {
       hostId: fields.hostId,
     };
     this.tabs.push(tab);
+    this.openOrder.set(key, order);
     this.activeKey = key;
     this.refreshTitles();
     this.emit();
@@ -324,11 +349,16 @@ export class TabStrip {
 
   private refreshTitles(): void {
     const seen = new Map<string, number>();
+    const opened = (tab: TabModel) => this.openOrder.get(tab.key) ?? 0;
+    // Number by open order, not position, so a dragged tab keeps its title.
+    const sessions = this.tabs.filter((tab) => tab.kind === "session");
+    sessions.sort((a, b) => opened(a) - opened(b));
     for (const tab of this.tabs) {
       if (tab.kind === "home") {
         tab.title = HOME_TITLE;
-        continue;
       }
+    }
+    for (const tab of sessions) {
       const name = deviceTabTitle(tab.deviceName ?? "", tab.connectionName);
       const count = (seen.get(name) ?? 0) + 1;
       seen.set(name, count);
@@ -339,4 +369,22 @@ export class TabStrip {
   private emit(): void {
     this.deps.onChange?.();
   }
+}
+
+/**
+ * Where a dragged tab belongs among the session tabs, from the pointer's x.
+ * `centers` are the horizontal centres of the session tabs in their current
+ * order, the dragged one included at `dragged`. The result is the dragged
+ * tab's new position among the session tabs: the number of other tabs whose
+ * centre lies left of the pointer. Comparing against the other tabs' centres
+ * keeps the order steady while the pointer rests between two tabs.
+ */
+export function dropSlot(centers: readonly number[], dragged: number, x: number): number {
+  let slot = 0;
+  centers.forEach((center, index) => {
+    if (index !== dragged && center < x) {
+      slot += 1;
+    }
+  });
+  return slot;
 }
