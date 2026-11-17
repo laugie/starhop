@@ -30,6 +30,7 @@ test("#39 the tab list is only as wide as its tabs", () => {
 
 test("dragging a tab has its own rules and leaves the tab sizing alone", () => {
   assert.match(rule(".tab-dragging"), /\n\s*z-index: 1;/);
-  assert.match(css, /\n\.tabbar-dragging,\n\.tabbar-dragging \.tab \{[^}]*cursor: grabbing;/);
+  // \r?: Windows checkouts have CRLF line endings.
+  assert.match(css, /\n\.tabbar-dragging,\r?\n\.tabbar-dragging \.tab \{[^}]*cursor: grabbing;/);
   assert.equal(/transform|transition/.test(rule(".tab")), false, "拖动位移由脚本设置，.tab 不加过渡");
 });
